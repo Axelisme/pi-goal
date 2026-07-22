@@ -100,6 +100,7 @@ test("formatElapsed keeps seconds, minutes, and hours readable", () => {
 test("statusLine covers all lifecycle states", () => {
 	assert.equal(statusLine(null), undefined);
 	assert.equal(statusLine({ status: "active", tokenBudget: 1000, tokensUsed: 500, timeUsedSeconds: 10 }), "Pursuing goal (500 / 1K)");
+	assert.equal(statusLine({ status: "yielded", yieldReason: "waiting for provider", tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 10 }), "Goal yielded: waiting for provider");
 	assert.equal(statusLine({ status: "paused", tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 10 }), "Goal paused (/goal resume)");
 	assert.equal(statusLine({ status: "budget_limited", tokenBudget: 1000, tokensUsed: 1000, timeUsedSeconds: 10 }), "Goal unmet (1K / 1K)");
 	assert.equal(statusLine({ status: "budget_limited", tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 10 }), "Goal abandoned");
@@ -119,6 +120,7 @@ test("truncateObjective collapses whitespace and truncates at max", () => {
 test("goalEventStatus maps event kinds to display labels", () => {
 	assert.equal(goalEventStatus("active"), "active");
 	assert.equal(goalEventStatus("continuation"), "continuing");
+	assert.equal(goalEventStatus("yielded"), "yielded");
 	assert.equal(goalEventStatus("budget_limited"), "budget reached");
 	assert.equal(goalEventStatus("complete"), "achieved");
 });

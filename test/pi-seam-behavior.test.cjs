@@ -96,6 +96,9 @@ test("Pi message_end filters sibling tools before execution and yield terminates
 	assert.equal(result.isTerminal, undefined);
 	assert.equal(h.sent.length, 0, "yield must not queue its own marker while streaming");
 	assert.equal(h.entries.at(-1).data.goal.status, "yielded");
+	await h.commands.get("goal").handler("status", h.ctx);
+	assert.match(h.notices.at(-1), /Goal yielded: waiting for provider/);
+	assert.match(h.notices.at(-1), /Waiting for: waiting for provider/);
 	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 	await agent.prompt("external event");
 	assert.deepEqual(providerTools.at(-1).filter((name) => ["get_goal", "update_goal", "yield_goal"].includes(name)), ["get_goal", "update_goal", "yield_goal"]);
