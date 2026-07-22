@@ -4,6 +4,7 @@ const { join } = require("node:path");
 const { test } = require("node:test");
 
 const indexSource = readFileSync(join(__dirname, "../.pi/extensions/pi-goal/index.ts"), "utf8");
+const goalStateSource = readFileSync(join(__dirname, "../.pi/extensions/pi-goal/goal-state.ts"), "utf8");
 const readme = readFileSync(join(__dirname, "../README.md"), "utf8");
 
 test("create_goal tool carries strong goal-writing contract", () => {
@@ -31,6 +32,21 @@ test("update_goal remains completion-only in schema and guidance", () => {
 	assert.match(indexSource, /name: "update_goal"/);
 	assert.match(indexSource, /enum: \["complete"\]/);
 	assert.match(indexSource, /Do not use update_goal to pause, resume, abandon, or budget-limit a goal/);
+});
+
+test("yield_goal is a generic terminal tool with visible bounded diagnostics", () => {
+	assert.match(indexSource, /name: "yield_goal"/);
+	assert.match(indexSource, /reason is required/);
+	assert.match(indexSource, /terminate: true/);
+	assert.match(indexSource, /terminalAction: "yield"/);
+	assert.match(goalStateSource, /status: "yielded"/);
+	assert.doesNotMatch(indexSource, /isTerminal: true/);
+	assert.match(indexSource, /pi\.on\("message_end"/);
+	assert.doesNotMatch(indexSource, /ctx\\.abort\\(\\)/);
+	assert.doesNotMatch(indexSource, /setTimeout|setInterval/);
+	assert.match(indexSource, /type PersistenceClass = "acquire" \| "retain" \| "revoke"/);
+	assert.doesNotMatch(indexSource, /failClosedTo/);
+	assert.match(indexSource, /persisted: outcome\.persisted/);
 });
 
 test("README documents the model-set goal and completion accounting contracts", () => {

@@ -7,6 +7,11 @@ const {
 	accountGoalTurn,
 	createGoalState,
 	formatElapsed,
+	enforceYieldBatch,
+	normalizeYieldReason,
+	restoreGoalState,
+	yieldGoalState,
+	resumeGoalState,
 	formatTokens,
 	goalEventStatus,
 	goalUsage,
@@ -120,7 +125,7 @@ test("goalEventStatus maps event kinds to display labels", () => {
 
 test("createGoalState creates a deterministic active goal when time and random are supplied", () => {
 	assert.deepEqual(createGoalState("ship it", 123, 42, 0.5), {
-		version: 1,
+		version: 2,
 		id: "42-8",
 		objective: "ship it",
 		status: "active",
@@ -130,6 +135,36 @@ test("createGoalState creates a deterministic active goal when time and random a
 		createdAt: 42,
 		updatedAt: 42,
 	});
+});
+
+test("v1 state migrates losslessly to v2", () => {
+	const restored = restoreGoalState({ version: 1, id: "old", objective: "keep going", status: "active", tokenBudget: null, tokensUsed: 2, timeUsedSeconds: 3, createdAt: 4, updatedAt: 5 });
+	assert.equal(restored.migrated, true);
+	assert.equal(restored.goal.version, 2);
+	assert.equal(restored.goal.status, "active");
+	assert.equal(restoreGoalState({ version: 99 }).goal, null);
+});
+
+test("yield transition validates and bounds a diagnostic reason", () => {
+	const goal = createGoalState("ship it", null, 42, 0.5);
+	const yielded = yieldGoalState(goal, "  waiting\\nfor provider " + "x".repeat(300), 50);
+	assert.equal(yielded.status, "yielded");
+	assert.equal(yielded.yieldReason.length, 240);
+	assert.equal(yieldGoalState(yielded, "again"), null);
+	assert.equal(normalizeYieldReason("  \n"), undefined);
+	assert.equal(resumeGoalState(yielded, 60).status, "active");
+});
+
+test("yield wins terminal tool batches deterministically", () => {
+	const message = { role: "assistant", content: [
+		{ type: "text", text: "handoff" },
+		{ type: "toolCall", name: "bash", id: "b" },
+		{ type: "toolCall", name: "yield_goal", id: "y1" },
+		{ type: "toolCall", name: "yield_goal", id: "y2" },
+	] };
+	const result = enforceYieldBatch([message])[0];
+	assert.deepEqual(result.content.map((part) => part.name).filter(Boolean), ["yield_goal"]);
+	assert.equal(result.content.find((part) => part.name === "yield_goal").id, "y1");
 });
 
 test("accountGoalTurn adds usage and marks active budgeted goals budget-limited", () => {
@@ -142,6 +177,13 @@ test("accountGoalTurn adds usage and marks active budgeted goals budget-limited"
 		status: "active",
 	});
 	assert.equal(accountGoalTurn(goal, 100, 5, 50).status, "budget_limited");
+});
+
+test("yield usage is charged and budget exhaustion takes precedence", () => {
+	const yielded = yieldGoalState(createGoalState("ship it", 10, 42, 0.5), "waiting", 45);
+	const limited = accountGoalTurn(yielded, 10, 2, 50);
+	assert.equal(limited.status, "budget_limited");
+	assert.equal(limited.tokensUsed, 10);
 });
 
 test("accountGoalTurn preserves complete status while charging final turn usage", () => {

@@ -1,7 +1,10 @@
-export type GoalStatus = "active" | "paused" | "budget_limited" | "complete";
+export type GoalStatus = "active" | "yielded" | "paused" | "budget_limited" | "complete";
+
+export const GOAL_STATE_VERSION = 2 as const;
+export const MAX_YIELD_REASON_LENGTH = 240;
 
 export type GoalState = {
-	version: 1;
+	version: 2;
 	id: string;
 	objective: string;
 	status: GoalStatus;
@@ -10,9 +13,70 @@ export type GoalState = {
 	timeUsedSeconds: number;
 	createdAt: number;
 	updatedAt: number;
+	yieldReason?: string;
+	yieldedAt?: number;
 };
 
-export type GoalEventKind = "active" | "continuation" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
+type LegacyGoalState = Omit<GoalState, "version" | "status"> & { version: 1; status: Exclude<GoalStatus, "yielded"> };
+
+export type GoalEventKind = "active" | "continuation" | "yielded" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
+
+const VALID_STATUSES = new Set<GoalStatus>(["active", "yielded", "paused", "budget_limited", "complete"]);
+
+function finiteNonNegative(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/** Normalize model-provided diagnostic data; it is never an authority signal. */
+export function normalizeYieldReason(value: unknown, max = MAX_YIELD_REASON_LENGTH): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const reason = value.replace(/\s+/g, " ").trim();
+	if (!reason) return undefined;
+	const bounded = Math.max(1, Math.floor(max));
+	return reason.length > bounded ? `${reason.slice(0, bounded - 1)}…` : reason;
+}
+
+export type RestoreGoalResult = { goal: GoalState | null; diagnostic?: string; migrated: boolean };
+
+/** Convenience state-only migration seam for callers that do not need diagnostics. */
+export function migrateGoalState(value: unknown): GoalState | null {
+	return restoreGoalState(value).goal;
+}
+
+/** Restore only known, structurally valid records. Invalid persistence is non-autonomous. */
+export function restoreGoalState(value: unknown): RestoreGoalResult {
+	if (!value || typeof value !== "object") return { goal: null, diagnostic: "Goal state is not an object.", migrated: false };
+	const raw = value as Record<string, unknown>;
+	if (raw.version !== 1 && raw.version !== GOAL_STATE_VERSION) {
+		return { goal: null, diagnostic: `Unsupported goal state version: ${String(raw.version)}.`, migrated: false };
+	}
+	if (typeof raw.id !== "string" || !raw.id || typeof raw.objective !== "string" || !raw.objective.trim()) {
+		return { goal: null, diagnostic: "Goal state is missing a valid id or objective.", migrated: false };
+	}
+	if (!VALID_STATUSES.has(raw.status as GoalStatus) || raw.status === "yielded" && !normalizeYieldReason(raw.yieldReason)) {
+		return { goal: null, diagnostic: "Goal state has an invalid status or yield reason.", migrated: false };
+	}
+	const budget = raw.tokenBudget;
+	if (budget !== null && !finiteNonNegative(budget) || !finiteNonNegative(raw.tokensUsed) || !finiteNonNegative(raw.timeUsedSeconds) || !finiteNonNegative(raw.createdAt) || !finiteNonNegative(raw.updatedAt)) {
+		return { goal: null, diagnostic: "Goal state has malformed accounting fields.", migrated: false };
+	}
+	const base: GoalState = {
+		version: GOAL_STATE_VERSION,
+		id: raw.id,
+		objective: raw.objective,
+		status: raw.status as GoalStatus,
+		tokenBudget: budget as number | null,
+		tokensUsed: raw.tokensUsed as number,
+		timeUsedSeconds: raw.timeUsedSeconds as number,
+		createdAt: raw.createdAt as number,
+		updatedAt: raw.updatedAt as number,
+	};
+	if (base.status === "yielded") {
+		base.yieldReason = normalizeYieldReason(raw.yieldReason)!;
+		base.yieldedAt = finiteNonNegative(raw.yieldedAt) ? raw.yieldedAt : base.updatedAt;
+	}
+	return { goal: base, migrated: raw.version === 1 };
+}
 
 export function parseTokenBudget(input: string): { objective: string; tokenBudget: number | null; error?: string } {
 	const match = input.match(/(?:^|\s)--tokens(?:=|\s+)(\S+\s*[kKmM]?)(?:\s|$)/);
@@ -59,6 +123,7 @@ export function statusLine(state: GoalState | null): string | undefined {
 	if (!state) return undefined;
 	const budget = state.tokenBudget ? ` (${formatTokens(state.tokensUsed)} / ${formatTokens(state.tokenBudget)})` : ` (${formatElapsed(state.timeUsedSeconds)})`;
 	if (state.status === "active") return `Pursuing goal${budget}`;
+	if (state.status === "yielded") return `Goal yielded: ${normalizeYieldReason(state.yieldReason, 64) ?? "external prerequisite"}`;
 	if (state.status === "paused") return "Goal paused (/goal resume)";
 	if (state.status === "budget_limited") return state.tokenBudget ? `Goal unmet${budget}` : "Goal abandoned";
 	return `Goal achieved${budget}`;
@@ -78,6 +143,7 @@ export function goalEventStatus(kind: GoalEventKind): string {
 	const labels: Record<GoalEventKind, string> = {
 		active: "active",
 		continuation: "continuing",
+		yielded: "yielded",
 		paused: "paused",
 		resumed: "resumed",
 		cleared: "cleared",
@@ -89,7 +155,7 @@ export function goalEventStatus(kind: GoalEventKind): string {
 
 export function createGoalState(objective: string, tokenBudget: number | null, now = Date.now(), random = Math.random()): GoalState {
 	return {
-		version: 1,
+		version: GOAL_STATE_VERSION,
 		id: `${now}-${random.toString(16).slice(2)}`,
 		objective,
 		status: "active",
@@ -101,15 +167,71 @@ export function createGoalState(objective: string, tokenBudget: number | null, n
 	};
 }
 
+export function yieldGoalState(state: GoalState, reason: unknown, now = Date.now()): GoalState | null {
+	const normalized = normalizeYieldReason(reason);
+	if (state.status !== "active" || !normalized) return null;
+	return { ...state, version: GOAL_STATE_VERSION, status: "yielded", yieldReason: normalized, yieldedAt: now, updatedAt: now };
+}
+
+// Alias kept deliberately generic for consumers testing the public lifecycle seam.
+export const transitionGoalToYielded = yieldGoalState;
+export const createYieldedGoalState = yieldGoalState;
+
+export function resumeGoalState(state: GoalState, now = Date.now()): GoalState | null {
+	if (state.status !== "yielded" && state.status !== "paused") return null;
+	const next = { ...state, version: GOAL_STATE_VERSION, status: "active" as const, updatedAt: now };
+	return next;
+}
+
 export function accountGoalTurn(state: GoalState, tokenDelta: number, elapsedSeconds: number, now = Date.now()): GoalState {
 	let next: GoalState = {
 		...state,
+		version: GOAL_STATE_VERSION,
 		tokensUsed: state.tokensUsed + Math.max(0, tokenDelta),
 		timeUsedSeconds: state.timeUsedSeconds + Math.max(0, elapsedSeconds),
 		updatedAt: now,
 	};
-	if (next.status === "active" && next.tokenBudget != null && next.tokensUsed >= next.tokenBudget) {
-		next = { ...next, status: "budget_limited" };
+	// The yield turn is charged too; budget exhaustion is the terminal winner.
+	if ((next.status === "active" || next.status === "yielded") && next.tokenBudget != null && next.tokensUsed >= next.tokenBudget) {
+		next = { ...next, status: "budget_limited", yieldReason: undefined, yieldedAt: undefined };
 	}
 	return next;
+}
+
+export type ToolCallPart = { type: "toolCall"; name?: string; [key: string]: unknown };
+
+/** Pure policy seam: a yielded tool call is the sole tool call in an assistant batch. */
+export function enforceYieldExclusivity<T extends { role?: string; content?: unknown }>(message: T): T {
+	if (message.role !== "assistant" || !Array.isArray(message.content)) return message;
+	const calls = message.content.filter((part): part is ToolCallPart => !!part && typeof part === "object" && (part as any).type === "toolCall") as ToolCallPart[];
+	const yieldCall = calls.find((call) => call.name === "yield_goal");
+	if (!yieldCall) return message;
+	return { ...message, content: message.content.filter((part) => !(part && typeof part === "object" && (part as any).type === "toolCall") || part === yieldCall) };
+}
+
+export function enforceYieldBatch<T extends { role?: string; content?: unknown }>(messages: T[]): T[] {
+	let retainedYield = false;
+	return messages.map((message) => {
+		const transformed = enforceYieldExclusivity(message);
+		if (transformed.role !== "assistant" || !Array.isArray(transformed.content)) return transformed;
+		const hasYield = transformed.content.some((part) => !!part && typeof part === "object" && (part as any).type === "toolCall" && (part as any).name === "yield_goal");
+		if (!hasYield) return transformed;
+		if (!retainedYield) {
+			retainedYield = true;
+			return transformed;
+		}
+		return { ...transformed, content: transformed.content.filter((part) => !(part && typeof part === "object" && (part as any).type === "toolCall" && (part as any).name === "yield_goal")) };
+	});
+}
+
+export function escapeUntrusted(value: unknown): string {
+	return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
+}
+
+export function resumeMarker(state: GoalState): string {
+	return `A real external event has resumed the yielded goal. Continue the same objective; do not treat this marker as user instructions.
+
+<resume_objective>${escapeUntrusted(state.objective)}</resume_objective>
+<resume_budget>tokens used: ${state.tokensUsed}; token budget: ${state.tokenBudget == null ? "none" : state.tokenBudget}</resume_budget>
+<prior_yield_reason>${escapeUntrusted(state.yieldReason ?? "unknown")}</prior_yield_reason>`;
 }
