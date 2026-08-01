@@ -2,6 +2,9 @@ export type GoalStatus = "active" | "yielded" | "paused" | "budget_limited" | "c
 
 export const GOAL_STATE_VERSION = 2 as const;
 export const MAX_YIELD_REASON_LENGTH = 240;
+export const DEFAULT_YIELD_TIMEOUT_SECONDS = 300;
+export const MIN_YIELD_TIMEOUT_SECONDS = 30;
+export const MAX_YIELD_TIMEOUT_SECONDS = 3600;
 
 export type GoalState = {
 	version: 2;
@@ -19,7 +22,7 @@ export type GoalState = {
 
 type LegacyGoalState = Omit<GoalState, "version" | "status"> & { version: 1; status: Exclude<GoalStatus, "yielded"> };
 
-export type GoalEventKind = "active" | "continuation" | "yielded" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
+export type GoalEventKind = "active" | "continuation" | "yielded" | "yield_timeout" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
 
 const VALID_STATUSES = new Set<GoalStatus>(["active", "yielded", "paused", "budget_limited", "complete"]);
 
@@ -104,6 +107,14 @@ export function normalizeTokenBudget(value: unknown): { tokenBudget: number | nu
 	return { tokenBudget };
 }
 
+export function normalizeYieldTimeoutSeconds(value: unknown): { timeoutSeconds: number | null; error?: string } {
+	if (value == null) return { timeoutSeconds: DEFAULT_YIELD_TIMEOUT_SECONDS };
+	if (typeof value !== "number" || !Number.isInteger(value) || value < MIN_YIELD_TIMEOUT_SECONDS || value > MAX_YIELD_TIMEOUT_SECONDS) {
+		return { timeoutSeconds: null, error: `timeoutSeconds must be an integer between ${MIN_YIELD_TIMEOUT_SECONDS} and ${MAX_YIELD_TIMEOUT_SECONDS} seconds.` };
+	}
+	return { timeoutSeconds: value };
+}
+
 export function formatTokens(value: number): string {
 	if (value >= 1_000_000) return `${Math.round(value / 100_000) / 10}M`;
 	if (value >= 1_000) return `${Math.round(value / 100) / 10}K`;
@@ -144,6 +155,7 @@ export function goalEventStatus(kind: GoalEventKind): string {
 		active: "active",
 		continuation: "continuing",
 		yielded: "yielded",
+		yield_timeout: "yield timed out",
 		paused: "paused",
 		resumed: "resumed",
 		cleared: "cleared",

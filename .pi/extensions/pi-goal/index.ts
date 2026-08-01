@@ -12,6 +12,7 @@ import {
 	type GoalState,
 	type GoalStatus,
 	normalizeTokenBudget,
+	normalizeYieldTimeoutSeconds,
 	enforceYieldBatch,
 	resumeMarker,
 	restoreGoalState,
@@ -31,6 +32,8 @@ let statusBarEnabled = true;
 let activeTurnStartedAt: number | null = null;
 let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
+let yieldTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
+let yieldTimeoutEpoch = 0;
 // Set only for the first provider context after a yielded goal is reactivated.
 // This is transient and intentionally never persisted.
 let resumeMarkerPending = false;
@@ -46,6 +49,8 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 			return continuationPrompt(state);
 		case "yielded":
 			return `The active thread goal has yielded control until a real external event starts another agent turn. Do not continue autonomously and do not poll or set a timer.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nYield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
+		case "yield_timeout":
+			return `The yield fallback timeout elapsed before an external wake-up was observed. Reassess the prerequisite; do not assume it completed. Continue safe work if possible, or yield again only for a concrete future event.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nPrior yield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
 		case "budget_limited":
 			return budgetLimitPrompt(state);
 		case "paused":
@@ -153,6 +158,7 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 			continuationQueued = false;
 			resumeMarkerPending = false;
 		}
+		if (goal?.status !== "yielded") clearYieldTimeout();
 		updateStatusBar(ctx);
 		syncGoalTools(pi);
 		return {
@@ -167,6 +173,7 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 	if (next?.status !== "active") {
 		continuationQueued = false;
 	}
+	if (next?.status !== "yielded") clearYieldTimeout();
 	updateStatusBar(ctx);
 	syncGoalTools(pi);
 	return { persisted: true, goal: next, classification: effectiveClass, mode: "committed" };
@@ -181,6 +188,31 @@ function reportPersistenceFailure(ctx: ExtensionContext, operation: string, outc
 	if (outcome.persisted) return false;
 	ctx.ui.notify(`${operation}: ${outcome.diagnostic ?? "durability unavailable"}`, "warning");
 	return true;
+}
+
+function clearYieldTimeout() {
+	yieldTimeoutEpoch += 1;
+	if (yieldTimeoutHandle !== null) clearTimeout(yieldTimeoutHandle);
+	yieldTimeoutHandle = null;
+}
+
+function armYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalState, timeoutSeconds: number): number {
+	clearYieldTimeout();
+	const epoch = yieldTimeoutEpoch;
+	const goalId = state.id;
+	const yieldedAt = state.yieldedAt;
+	const timeoutAt = Date.now() + timeoutSeconds * 1000;
+	yieldTimeoutHandle = setTimeout(() => {
+		if (yieldTimeoutEpoch !== epoch) return;
+		yieldTimeoutHandle = null;
+		if (!goal || goal.id !== goalId || goal.status !== "yielded" || goal.yieldedAt !== yieldedAt || ctx.hasPendingMessages()) return;
+		try {
+			emitGoalEvent(pi, "yield_timeout", goal, { triggerTurn: true, deliverAs: "followUp" });
+		} catch (error) {
+			ctx.ui.notify(`Goal yield timeout could not start a fallback turn: ${String(error)}`, "warning");
+		}
+	}, timeoutSeconds * 1000);
+	return timeoutAt;
 }
 
 function continuationPrompt(state: GoalState): string {
@@ -341,17 +373,20 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "yield_goal",
 		label: "Yield Goal",
-		description: "Terminally yield the active goal until a real future agent turn arrives. This is the sole final action of the run; it never polls, expires, or waits for a provider-specific event.",
+		description: "Terminally yield the active goal until a real future agent turn arrives, with a bounded one-shot fallback timeout. This is the sole final action of the run and never polls or waits for a provider-specific event.",
 		promptSnippet: "Return control while the goal is blocked on a future external prerequisite",
 		promptGuidelines: [
-			"Call yield_goal only when no blocking tool is awaiting an in-run answer and no synchronous autonomous work remains.",
+			"Call yield_goal only when no blocking tool is awaiting an in-run answer, no synchronous autonomous work remains, and a concrete future event can start another turn.",
 			"Provide a concise reason naming the external prerequisite (for example child completion, provider result, authorization, or a future user reply).",
+			"yield_goal uses a five-minute fallback timeout by default; timeout expiry only requests a recheck and is not evidence that the prerequisite completed.",
+			"Set yield_goal timeoutSeconds only when the expected external event needs a different bounded recheck window between 30 and 3600 seconds.",
 			"yield_goal is terminal: make it the sole final tool action and do not call subagent_wait, ask_user_question, or another tool afterward.",
 		],
 		parameters: {
 			type: "object",
 			properties: {
 				reason: { type: "string", description: "Bounded diagnostic reason for the external prerequisite." },
+				timeoutSeconds: { type: "integer", minimum: 30, maximum: 3600, description: "Optional one-shot fallback timeout in seconds; defaults to 300." },
 			},
 			required: ["reason"],
 			additionalProperties: false,
@@ -364,17 +399,22 @@ export default function piGoal(pi: ExtensionAPI) {
 			if (!normalized) {
 				throw new Error("reason is required and must be a non-empty string.");
 			}
+			const parsedTimeout = normalizeYieldTimeoutSeconds((params as any).timeoutSeconds);
+			if (parsedTimeout.error || parsedTimeout.timeoutSeconds == null) {
+				throw new Error(parsedTimeout.error ?? "Invalid yield timeout.");
+			}
 			const next = yieldGoalState(goal, normalized);
 			if (!next) {
 				throw new Error("Unable to yield the current goal.");
 			}
 			const outcome = persist(pi, ctx, next, "revoke");
+			const timeoutAt = outcome.persisted ? armYieldTimeout(pi, ctx, next, parsedTimeout.timeoutSeconds) : null;
 			// Do not publish a custom marker here: Pi queues sendMessage() as steer
 			// while streaming, which would turn this terminal action into a wake-up.
 			// The tool result details and status bar are the observable handoff.
 			return {
-				content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, terminal: true, terminalAction: "yield", persisted: outcome.persisted, diagnostic: outcome.diagnostic ?? null }, null, 2) }],
-				details: { goal: outcome.goal, terminal: true, terminalAction: "yield", persisted: outcome.persisted, diagnostic: outcome.diagnostic },
+				content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, terminal: true, terminalAction: "yield", timeoutSeconds: parsedTimeout.timeoutSeconds, timeoutAt, persisted: outcome.persisted, diagnostic: outcome.diagnostic ?? null }, null, 2) }],
+				details: { goal: outcome.goal, terminal: true, terminalAction: "yield", timeoutSeconds: parsedTimeout.timeoutSeconds, timeoutAt, persisted: outcome.persisted, diagnostic: outcome.diagnostic },
 				terminate: true,
 			} as any;
 		},
@@ -522,6 +562,7 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (event, ctx) => {
+		clearYieldTimeout();
 		const restored = latestStateFromSession(ctx);
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
@@ -581,6 +622,7 @@ export default function piGoal(pi: ExtensionAPI) {
 		// A native queued event is authoritative: it starts the next turn and
 		// wakes a yielded goal without manufacturing another queue item.
 		if (goal?.status === "yielded") {
+			clearYieldTimeout();
 			const resumed = resumeGoalState(goal);
 			if (resumed) {
 				// Persist while the in-memory authority is still yielded. If the
@@ -619,5 +661,9 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.on("agent_end", (_event, ctx) => {
 		if (!goal || goal.status !== "active" || ctx.hasPendingMessages()) return;
 		queueContinuation(pi, goal);
+	});
+
+	pi.on("session_shutdown", () => {
+		clearYieldTimeout();
 	});
 }
