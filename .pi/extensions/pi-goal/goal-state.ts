@@ -22,7 +22,7 @@ export type GoalState = {
 
 type LegacyGoalState = Omit<GoalState, "version" | "status"> & { version: 1; status: Exclude<GoalStatus, "yielded"> };
 
-export type GoalEventKind = "active" | "continuation" | "yielded" | "yield_timeout" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
+export type GoalEventKind = "active" | "continuation" | "yielded" | "yield_timeout" | "subagent_completion" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
 
 const VALID_STATUSES = new Set<GoalStatus>(["active", "yielded", "paused", "budget_limited", "complete"]);
 
@@ -156,6 +156,7 @@ export function goalEventStatus(kind: GoalEventKind): string {
 		continuation: "continuing",
 		yielded: "yielded",
 		yield_timeout: "yield timed out",
+		subagent_completion: "subagent completed",
 		paused: "paused",
 		resumed: "resumed",
 		cleared: "cleared",
