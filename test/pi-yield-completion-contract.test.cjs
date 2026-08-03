@@ -7,9 +7,8 @@ const { createJiti } = require("jiti");
 const globalPi = "/usr/lib/node_modules/@earendil-works/pi-coding-agent";
 const options = existsSync(globalPi) ? {} : { skip: "Pi 0.81.1 global runtime is unavailable" };
 
-function makeHarness({ entries = [], idle = false, pending = false, sessionId = "session-current" } = {}) {
+function makeHarness({ entries = [], idle = false, pending = false } = {}) {
 	const handlers = new Map();
-	const eventHandlers = new Map();
 	const tools = new Map();
 	const commands = new Map();
 	const sent = [];
@@ -19,17 +18,6 @@ function makeHarness({ entries = [], idle = false, pending = false, sessionId = 
 	let hasPendingMessages = pending;
 	const pi = {
 		on(name, handler) { handlers.set(name, handler); },
-		events: {
-			on(name, handler) {
-				const listeners = eventHandlers.get(name) ?? new Set();
-				listeners.add(handler);
-				eventHandlers.set(name, listeners);
-				return () => listeners.delete(handler);
-			},
-			emit(name, data) {
-				for (const handler of eventHandlers.get(name) ?? []) handler(data);
-			},
-		},
 		registerTool(tool) { tools.set(tool.name, tool); },
 		registerCommand(name, command) { commands.set(name, command); },
 		registerMessageRenderer() {},
@@ -39,7 +27,7 @@ function makeHarness({ entries = [], idle = false, pending = false, sessionId = 
 		setActiveTools(next) { activeTools = next; },
 	};
 	const ctx = {
-		sessionManager: { getEntries: () => entries, getBranch: () => entries, getSessionId: () => sessionId },
+		sessionManager: { getEntries: () => entries, getBranch: () => entries },
 		ui: {
 			setStatus() {},
 			notify(message) { notices.push(String(message)); },
@@ -49,7 +37,7 @@ function makeHarness({ entries = [], idle = false, pending = false, sessionId = 
 		hasPendingMessages: () => hasPendingMessages,
 	};
 	return {
-		pi, ctx, handlers, eventHandlers, tools, commands, sent, notices, entries,
+		pi, ctx, handlers, tools, commands, sent, notices, entries,
 		setIdle(value) { isIdle = value; },
 		setPending(value) { hasPendingMessages = value; },
 	};
@@ -83,37 +71,6 @@ function lastGoal(h) {
 function flushMicrotasks() {
 	return new Promise((resolvePromise) => setImmediate(resolvePromise));
 }
-
-test("successful same-session subagent completion wakes one yielded goal turn", options, async (t) => {
-	const h = makeHarness();
-	await install(h);
-	t.after(() => h.handlers.get("session_shutdown")());
-	await createYielded(h, "inspect the child result", "waiting for a background child");
-	const yielded = lastGoal(h);
-
-	const completion = {
-		runId: "run-123",
-		sessionId: "session-current",
-		state: "completed",
-		success: true,
-		exitCode: 0,
-	};
-	h.pi.events.emit("subagent:async-complete", completion);
-	h.pi.events.emit("subagent:async-complete", completion);
-	h.pi.events.emit("subagent:async-complete", { ...completion, runId: "run-sibling" });
-
-	assert.equal(h.sent.length, 1, "one yield epoch queues one wake-up turn");
-	assert.equal(h.sent[0].options.triggerTurn, true);
-	assert.equal(h.sent[0].options.deliverAs, "followUp");
-	assert.match(h.sent[0].message.content, /completion.*observed|observed.*completion/i);
-	assert.match(h.sent[0].message.content, /inspect/i);
-	assert.doesNotMatch(h.sent[0].message.content, /task (?:is |was )?(?:complete|successful)|goal (?:is |was )?(?:complete|successful)/i);
-	assert.deepEqual(lastGoal(h), yielded, "completion observation must not acquire or persist active authority");
-
-	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
-	assert.equal(lastGoal(h).id, yielded.id);
-	assert.equal(lastGoal(h).status, "active");
-});
 
 test("persisted yielded v2 restore pauses safely with its objective and reason, without continuation", options, async () => {
 	const yielded = {

@@ -135,7 +135,6 @@ test("goalEventStatus maps event kinds to display labels", () => {
 	assert.equal(goalEventStatus("continuation"), "continuing");
 	assert.equal(goalEventStatus("yielded"), "yielded");
 	assert.equal(goalEventStatus("yield_timeout"), "yield timed out");
-	assert.equal(goalEventStatus("subagent_completion"), "subagent completed");
 	assert.equal(goalEventStatus("budget_limited"), "budget reached");
 	assert.equal(goalEventStatus("complete"), "achieved");
 });

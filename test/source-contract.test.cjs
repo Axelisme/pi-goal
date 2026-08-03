@@ -55,6 +55,12 @@ test("yield_goal is terminal with a bounded one-shot fallback timeout", () => {
 	assert.match(indexSource, /persisted: outcome\.persisted/);
 });
 
+test("provider-specific subagent wake ownership stays outside pi-goal", () => {
+	assert.doesNotMatch(indexSource, /subagent:async-complete/);
+	assert.doesNotMatch(indexSource, /pi\.events(?:\?|)\.on/);
+	assert.match(readme, /Provider-specific wake integrations belong in separate extensions/);
+});
+
 test("README documents goal accounting and yield fallback contracts", () => {
 	assert.match(readme, /`create_goal` tool: model can set or replace the current goal only when explicitly requested/);
 	assert.match(readme, /The final turn is still accounted even when the model completes the goal mid-turn/);

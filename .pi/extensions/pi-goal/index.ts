@@ -26,7 +26,6 @@ import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
-const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 
 let goal: GoalState | null = null;
 let statusBarEnabled = true;
@@ -35,8 +34,6 @@ let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
 let yieldTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
 let yieldTimeoutEpoch = 0;
-let currentSessionId: string | null = null;
-let subagentWakeLatch: { goalId: string; yieldedAt: number } | null = null;
 // Set only for the first provider context after a yielded goal is reactivated.
 // This is transient and intentionally never persisted.
 let resumeMarkerPending = false;
@@ -54,8 +51,6 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 			return `The active thread goal has yielded control until a real external event starts another agent turn. Do not continue autonomously and do not poll or set a timer.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nYield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
 		case "yield_timeout":
 			return `The yield fallback timeout elapsed before an external wake-up was observed. Reassess the prerequisite; do not assume it completed. Continue safe work if possible, or yield again only for a concrete future event.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nPrior yield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
-		case "subagent_completion":
-			return `A same-session subagent process completion was observed. Inspect the child result and other relevant evidence before deciding whether the prerequisite, delegated task, or goal succeeded.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nPrior yield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "subagent completion")}`;
 		case "budget_limited":
 			return budgetLimitPrompt(state);
 		case "paused":
@@ -199,35 +194,6 @@ function clearYieldTimeout() {
 	yieldTimeoutEpoch += 1;
 	if (yieldTimeoutHandle !== null) clearTimeout(yieldTimeoutHandle);
 	yieldTimeoutHandle = null;
-	subagentWakeLatch = null;
-}
-
-function isSuccessfulSubagentCompletion(value: unknown): value is { sessionId: string; success: true; exitCode: 0 } {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const event = value as Record<string, unknown>;
-	return typeof event.sessionId === "string"
-		&& event.sessionId.length > 0
-		&& event.sessionId === currentSessionId
-		&& event.success === true
-		&& event.exitCode === 0
-		&& event.interrupted !== true
-		&& event.timedOut !== true
-		&& event.stopped !== true
-		&& event.turnBudgetExceeded !== true;
-}
-
-function queueSubagentCompletionWake(pi: ExtensionAPI, value: unknown) {
-	if (!goal || goal.status !== "yielded" || !isSuccessfulSubagentCompletion(value)) return;
-	const latch = { goalId: goal.id, yieldedAt: goal.yieldedAt ?? goal.updatedAt };
-	if (subagentWakeLatch?.goalId === latch.goalId && subagentWakeLatch.yieldedAt === latch.yieldedAt) return;
-	subagentWakeLatch = latch;
-	try {
-		emitGoalEvent(pi, "subagent_completion", goal, { triggerTurn: true, deliverAs: "followUp" });
-	} catch {
-		if (subagentWakeLatch?.goalId === latch.goalId && subagentWakeLatch.yieldedAt === latch.yieldedAt) {
-			subagentWakeLatch = null;
-		}
-	}
 }
 
 function armYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalState, timeoutSeconds: number): number {
@@ -321,10 +287,6 @@ function agentRunWasAborted(messages: unknown): boolean {
 }
 
 export default function piGoal(pi: ExtensionAPI) {
-	const unsubscribeSubagentCompletion = pi.events?.on?.(SUBAGENT_ASYNC_COMPLETE_EVENT, (data) => {
-		queueSubagentCompletionWake(pi, data);
-	}) ?? (() => {});
-
 	pi.registerMessageRenderer(EVENT_TYPE, (message, { expanded }, theme) => {
 		const details = message.details as { kind?: GoalEventKind; goal?: GoalState | null; timestamp?: number } | undefined;
 		const kind = details?.kind ?? "continuation";
@@ -610,8 +572,6 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("session_start", (event, ctx) => {
 		clearYieldTimeout();
-		const sessionId = ctx.sessionManager.getSessionFile?.() ?? ctx.sessionManager.getSessionId?.();
-		currentSessionId = typeof sessionId === "string" && sessionId.length > 0 ? sessionId : null;
 		const restored = latestStateFromSession(ctx);
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
@@ -726,8 +686,6 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
-		currentSessionId = null;
 		clearYieldTimeout();
-		unsubscribeSubagentCompletion();
 	});
 }
