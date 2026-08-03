@@ -33,7 +33,7 @@ pi install git:github.com/Michaelliv/pi-goal
 
 When a goal is active, the extension shows compact visible lifecycle markers like `Goal active` and `Goal continuing`; expand them with `ctrl+o` to inspect the objective and usage. The full continuation instructions ride along as the content of that custom message, so the model always has the objective and audit guidance in the transcript while the renderer keeps the visible UI compact.
 
-The same Pi agent keeps running normal turns in the same session context until it calls `update_goal({ status: "complete" })`, calls `yield_goal({ reason })`, the user pauses/clears it, or the token budget is reached. `yield_goal` is a terminal handoff: it requires a concise bounded reason, stops immediate automatic continuation, and waits for a real future agent turn. To prevent an accidental yield from blocking forever, it arms a one-shot five-minute fallback timeout by default; `timeoutSeconds` may select a bounded 30–3600 second recheck window. A pending native message takes precedence and resumes the goal before the fallback. Timeout expiry asks the agent to reassess and does not mean the prerequisite completed. Reloading/restoring Pi clears the timer and converts a yielded goal to paused instead of silently resuming it; use `/goal resume` to continue.
+The same Pi agent keeps running normal turns in the same session context until it calls `update_goal({ status: "complete" })`, calls `yield_goal({ reason })`, the user pauses/clears or interrupts it, or the token budget is reached. Interrupting an active run (for example with Esc in the TUI) automatically persists the goal as paused, so `agent_end` cannot immediately start another continuation. `yield_goal` is a terminal handoff: it requires a concise bounded reason, stops immediate automatic continuation, and waits for a real future agent turn. To prevent an accidental yield from blocking forever, it arms a one-shot five-minute fallback timeout by default; `timeoutSeconds` may select a bounded 30–3600 second recheck window. A pending native message takes precedence and resumes the goal before the fallback. Timeout expiry asks the agent to reassess and does not mean the prerequisite completed. Reloading/restoring Pi clears the timer and converts a yielded goal to paused instead of silently resuming it; use `/goal resume` to continue.
 
 ## What it adds
 
@@ -63,6 +63,7 @@ The same Pi agent keeps running normal turns in the same session context until i
   -> queue another continuation on agent_end while active
   -> yield_goal persists `yielded`, arms one fallback timeout, and emits no immediate continuation
   -> a native event resumes first, or timeout expiry queues one recheck turn
+  -> pause when the user interrupts an active run, without queuing a wake-up message
   -> stop when update_goal marks complete, user pauses/clears, or budget is hit
 ```
 

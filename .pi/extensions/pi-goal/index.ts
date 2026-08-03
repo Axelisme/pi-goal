@@ -277,6 +277,15 @@ function queueContinuation(pi: ExtensionAPI, state: GoalState) {
 	});
 }
 
+function agentRunWasAborted(messages: unknown): boolean {
+	if (!Array.isArray(messages)) return false;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i] as { role?: string; stopReason?: string } | undefined;
+		if (message?.role === "assistant") return message.stopReason === "aborted";
+	}
+	return false;
+}
+
 export default function piGoal(pi: ExtensionAPI) {
 	pi.registerMessageRenderer(EVENT_TYPE, (message, { expanded }, theme) => {
 		const details = message.details as { kind?: GoalEventKind; goal?: GoalState | null; timestamp?: number } | undefined;
@@ -658,8 +667,21 @@ export default function piGoal(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("agent_end", (_event, ctx) => {
-		if (!goal || goal.status !== "active" || ctx.hasPendingMessages()) return;
+	pi.on("agent_end", (event, ctx) => {
+		if (!goal || goal.status !== "active") return;
+		if (agentRunWasAborted(event.messages)) {
+			const paused = { ...goal, status: "paused" as const, updatedAt: Date.now() };
+			const outcome = persist(pi, ctx, paused, "revoke");
+			if (reportPersistenceFailure(ctx, "Goal interruption pause revoked autonomy in memory but is nondurable", outcome)) return;
+			// Do not emit a goal event here: any queued message could wake the run
+			// that the user explicitly interrupted.
+			ctx.ui.notify(
+				`‖ Goal paused after interruption: ${truncateObjective(paused.objective)}\nUse /goal resume to continue, or /goal clear to stop.`,
+				"info",
+			);
+			return;
+		}
+		if (ctx.hasPendingMessages()) return;
 		queueContinuation(pi, goal);
 	});
 

@@ -250,6 +250,23 @@ test("a yielded resume with a pending same-run message injects one marker and no
 	assert.equal(lastGoal(h).status, "active");
 });
 
+test("an aborted agent run pauses an active goal without queuing another continuation", options, async () => {
+	const h = makeHarness();
+	await install(h);
+	await h.tools.get("create_goal").execute("create", { objective: "stop when interrupted" }, null, null, h.ctx);
+	h.sent.length = 0;
+
+	h.handlers.get("agent_end")({ messages: [
+		{ role: "assistant", content: [], stopReason: "aborted" },
+	] }, h.ctx);
+	await flushMicrotasks();
+
+	assert.equal(lastGoal(h).status, "paused");
+	assert.deepEqual(h.pi.getActiveTools(), ["create_goal"]);
+	assert.equal(h.sent.length, 0, "an interruption must not publish or queue a wake-up message");
+	assert.match(h.notices.at(-1), /Goal paused after interruption/);
+});
+
 test("an active goal queues only when agent_end has no pending public message", options, async () => {
 	const h = makeHarness({ pending: true });
 	await install(h);
