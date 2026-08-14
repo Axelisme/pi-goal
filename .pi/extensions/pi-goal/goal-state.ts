@@ -4,7 +4,7 @@ export const GOAL_STATE_VERSION = 2 as const;
 export const MAX_YIELD_REASON_LENGTH = 240;
 export const DEFAULT_YIELD_TIMEOUT_SECONDS = 300;
 export const MIN_YIELD_TIMEOUT_SECONDS = 30;
-export const MAX_YIELD_TIMEOUT_SECONDS = 3600;
+export const MAX_YIELD_TIMEOUT_SECONDS = 600;
 
 export type GoalState = {
 	version: 2;

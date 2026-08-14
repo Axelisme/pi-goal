@@ -71,6 +71,14 @@ function lastGoal(h) {
 	return h.entries.at(-1)?.data?.goal;
 }
 
+test("yield_goal exposes a 30–600 second timeout range", options, async () => {
+	const h = makeHarness();
+	await install(h);
+	const timeoutSchema = h.tools.get("yield_goal").parameters.properties.timeoutSeconds;
+	assert.equal(timeoutSchema.minimum, 30);
+	assert.equal(timeoutSchema.maximum, 600);
+});
+
 test("yield_goal accepts a bounded custom timeout", options, async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const h = makeHarness();
@@ -94,8 +102,8 @@ test("an invalid timeout leaves the active goal unchanged", options, async (t) =
 	h.sent.length = 0;
 
 	await assert.rejects(
-		h.tools.get("yield_goal").execute("yield", { reason: "bad timeout", timeoutSeconds: 29 }, null, null, h.ctx),
-		/timeoutSeconds must be an integer between 30 and 3600 seconds/,
+		h.tools.get("yield_goal").execute("yield", { reason: "bad timeout", timeoutSeconds: 601 }, null, null, h.ctx),
+		/timeoutSeconds must be an integer between 30 and 600 seconds/,
 	);
 	assert.equal(lastGoal(h).status, "active");
 	t.mock.timers.runAll();

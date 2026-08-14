@@ -388,14 +388,14 @@ export default function piGoal(pi: ExtensionAPI) {
 			"Call yield_goal only when no blocking tool is awaiting an in-run answer, no synchronous autonomous work remains, and a concrete future event can start another turn.",
 			"Provide a concise reason naming the external prerequisite (for example child completion, provider result, authorization, or a future user reply).",
 			"yield_goal uses a five-minute fallback timeout by default; timeout expiry only requests a recheck and is not evidence that the prerequisite completed.",
-			"Set yield_goal timeoutSeconds only when the expected external event needs a different bounded recheck window between 30 and 3600 seconds.",
+			"Set yield_goal timeoutSeconds only when the expected external event needs a different bounded recheck window between 30 and 600 seconds.",
 			"yield_goal is terminal: make it the sole final tool action and do not call subagent_wait, ask_user_question, or another tool afterward.",
 		],
 		parameters: {
 			type: "object",
 			properties: {
 				reason: { type: "string", description: "Bounded diagnostic reason for the external prerequisite." },
-				timeoutSeconds: { type: "integer", minimum: 30, maximum: 3600, description: "Optional one-shot fallback timeout in seconds; defaults to 300." },
+				timeoutSeconds: { type: "integer", minimum: 30, maximum: 600, description: "Optional one-shot fallback timeout in seconds; defaults to 300." },
 			},
 			required: ["reason"],
 			additionalProperties: false,

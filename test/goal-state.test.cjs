@@ -86,11 +86,11 @@ test("normalizeTokenBudget rejects non-positive and non-numeric values", () => {
 test("yield timeout defaults to five minutes and enforces finite integer bounds", () => {
 	assert.deepEqual(normalizeYieldTimeoutSeconds(undefined), { timeoutSeconds: 300 });
 	assert.deepEqual(normalizeYieldTimeoutSeconds(30), { timeoutSeconds: 30 });
-	assert.deepEqual(normalizeYieldTimeoutSeconds(3600), { timeoutSeconds: 3600 });
-	for (const value of [0, 29, 3601, 30.5, Number.NaN, Number.POSITIVE_INFINITY, "300"]) {
+	assert.deepEqual(normalizeYieldTimeoutSeconds(600), { timeoutSeconds: 600 });
+	for (const value of [0, 29, 601, 30.5, Number.NaN, Number.POSITIVE_INFINITY, "300"]) {
 		assert.deepEqual(normalizeYieldTimeoutSeconds(value), {
 			timeoutSeconds: null,
-			error: "timeoutSeconds must be an integer between 30 and 3600 seconds.",
+			error: "timeoutSeconds must be an integer between 30 and 600 seconds.",
 		});
 	}
 });
