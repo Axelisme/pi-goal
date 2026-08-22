@@ -4,3 +4,4 @@ codex/
 *.tgz
 npm-debug.log*
 .pi
+.pi-subagents
