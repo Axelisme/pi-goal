@@ -34,6 +34,14 @@ let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
 let yieldTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
 let yieldTimeoutEpoch = 0;
+const YIELD_TIMEOUT_COMPACTION_THRESHOLD = 100_000;
+type YieldTimeoutOperation = {
+	epoch: number;
+	goalId: string;
+	yieldedAt: number | undefined;
+	phase: "evaluate" | "deliveryOnly";
+};
+let yieldTimeoutOperation: YieldTimeoutOperation | null = null;
 // Set only for the first provider context after a yielded goal is reactivated.
 // This is transient and intentionally never persisted.
 let resumeMarkerPending = false;
@@ -194,6 +202,77 @@ function clearYieldTimeout() {
 	yieldTimeoutEpoch += 1;
 	if (yieldTimeoutHandle !== null) clearTimeout(yieldTimeoutHandle);
 	yieldTimeoutHandle = null;
+	yieldTimeoutOperation = null;
+}
+
+function currentYieldTimeoutGoal(ctx: ExtensionContext, operation: YieldTimeoutOperation): GoalState | null {
+	if (
+		yieldTimeoutOperation !== operation
+		|| yieldTimeoutEpoch !== operation.epoch
+		|| !goal
+		|| goal.id !== operation.goalId
+		|| goal.status !== "yielded"
+		|| goal.yieldedAt !== operation.yieldedAt
+		|| ctx.hasPendingMessages()
+	) {
+		if (yieldTimeoutOperation === operation) yieldTimeoutOperation = null;
+		return null;
+	}
+	return goal;
+}
+
+function deliverYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, operation: YieldTimeoutOperation, state: GoalState) {
+	yieldTimeoutOperation = null;
+	try {
+		emitGoalEvent(pi, "yield_timeout", state, { triggerTurn: true, deliverAs: "followUp" });
+	} catch (error) {
+		ctx.ui.notify(`Goal yield timeout could not start a fallback turn: ${String(error)}`, "warning");
+	}
+}
+
+function runYieldTimeoutOperation(pi: ExtensionAPI, ctx: ExtensionContext, operation: YieldTimeoutOperation) {
+	const state = currentYieldTimeoutGoal(ctx, operation);
+	if (!state) return;
+
+	const getContextUsage = (ctx as any).getContextUsage;
+	const compact = (ctx as any).compact;
+	const supportsCompaction = typeof getContextUsage === "function" && typeof compact === "function";
+	if (operation.phase === "evaluate" && !supportsCompaction) {
+		deliverYieldTimeout(pi, ctx, operation, state);
+		return;
+	}
+	if (!ctx.isIdle()) return;
+
+	if (operation.phase === "evaluate") {
+		let tokens: number | null | undefined;
+		try {
+			tokens = getContextUsage.call(ctx)?.tokens;
+		} catch {
+			tokens = undefined;
+		}
+		if (tokens == null || tokens <= YIELD_TIMEOUT_COMPACTION_THRESHOLD) {
+			deliverYieldTimeout(pi, ctx, operation, state);
+			return;
+		}
+
+		operation.phase = "deliveryOnly";
+		const onFailure = (error: unknown) => {
+			if (!currentYieldTimeoutGoal(ctx, operation)) return;
+			ctx.ui.notify(`Goal yield timeout compaction failed: ${String(error)}`, "warning");
+			runYieldTimeoutOperation(pi, ctx, operation);
+		};
+		try {
+			compact.call(ctx, {
+				onComplete: () => runYieldTimeoutOperation(pi, ctx, operation),
+				onError: onFailure,
+			});
+		} catch (error) {
+			onFailure(error);
+		}
+		return;
+	}
+
+	deliverYieldTimeout(pi, ctx, operation, state);
 }
 
 function armYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalState, timeoutSeconds: number): number {
@@ -205,12 +284,9 @@ function armYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalSta
 	yieldTimeoutHandle = setTimeout(() => {
 		if (yieldTimeoutEpoch !== epoch) return;
 		yieldTimeoutHandle = null;
-		if (!goal || goal.id !== goalId || goal.status !== "yielded" || goal.yieldedAt !== yieldedAt || ctx.hasPendingMessages()) return;
-		try {
-			emitGoalEvent(pi, "yield_timeout", goal, { triggerTurn: true, deliverAs: "followUp" });
-		} catch (error) {
-			ctx.ui.notify(`Goal yield timeout could not start a fallback turn: ${String(error)}`, "warning");
-		}
+		const operation: YieldTimeoutOperation = { epoch, goalId, yieldedAt, phase: "evaluate" };
+		yieldTimeoutOperation = operation;
+		runYieldTimeoutOperation(pi, ctx, operation);
 	}, timeoutSeconds * 1000);
 	return timeoutAt;
 }
@@ -627,6 +703,12 @@ export default function piGoal(pi: ExtensionAPI) {
 		}
 	});
 
+	pi.on("input", () => {
+		// Input is observed before prompt preflight, including input released
+		// from Pi's compaction queue, so native intent wins over timeout work.
+		if (goal?.status === "yielded") clearYieldTimeout();
+	});
+
 	pi.on("turn_start", (_event, ctx) => {
 		// A native queued event is authoritative: it starts the next turn and
 		// wakes a yielded goal without manufacturing another queue item.
@@ -683,6 +765,11 @@ export default function piGoal(pi: ExtensionAPI) {
 		}
 		if (ctx.hasPendingMessages()) return;
 		queueContinuation(pi, goal);
+	});
+
+	pi.on("agent_settled", (_event, ctx) => {
+		const operation = yieldTimeoutOperation;
+		if (operation) runYieldTimeoutOperation(pi, ctx, operation);
 	});
 
 	pi.on("session_shutdown", () => {
