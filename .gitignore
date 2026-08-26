@@ -3,5 +3,9 @@ node_modules/
 codex/
 *.tgz
 npm-debug.log*
-.pi
+.pi/*
+!.pi/extensions/
+.pi/extensions/*
+!.pi/extensions/pi-goal/
+!.pi/extensions/pi-goal/**
 .pi-subagents

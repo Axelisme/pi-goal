@@ -23,12 +23,14 @@ import {
 	enforceYieldExclusivity,
 } from "./goal-state";
 import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
+import { createGoalFooter } from "./footer";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
 
 let goal: GoalState | null = null;
 let statusBarEnabled = true;
+let goalFooterInstalled = false;
 let activeTurnStartedAt: number | null = null;
 let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
@@ -113,7 +115,19 @@ function latestStateFromSession(ctx: ExtensionContext): { goal: GoalState | null
 }
 
 function updateStatusBar(ctx: ExtensionContext) {
-	ctx.ui.setStatus(CUSTOM_TYPE, statusBarEnabled ? statusLine(goal) ?? "" : "");
+	const goalStatus = statusBarEnabled ? statusLine(goal) : undefined;
+	ctx.ui.setStatus(CUSTOM_TYPE, goalStatus);
+	if (ctx.mode !== "tui") return;
+	if (goalStatus && !goalFooterInstalled) {
+		ctx.ui.setFooter((tui, theme, footerData) => createGoalFooter(ctx, tui, theme, footerData, {
+			statusKey: CUSTOM_TYPE,
+			goalStatus: () => statusBarEnabled ? statusLine(goal) : undefined,
+		}));
+		goalFooterInstalled = true;
+	} else if (!goalStatus && goalFooterInstalled) {
+		ctx.ui.setFooter(undefined);
+		goalFooterInstalled = false;
+	}
 }
 
 const ACTIVE_GOAL_TOOL_NAMES = ["get_goal", "update_goal", "yield_goal"];
@@ -648,6 +662,7 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("session_start", (event, ctx) => {
 		clearYieldTimeout();
+		goalFooterInstalled = false;
 		const restored = latestStateFromSession(ctx);
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
