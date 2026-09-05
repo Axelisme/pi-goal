@@ -89,7 +89,7 @@ test("persisted yielded v2 restore pauses safely with its objective and reason, 
 	const h = makeHarness({ entries: [{ type: "custom", customType: "pi-goal", data: { goal: yielded, statusBarEnabled: true } }] });
 	await install(h, "reload");
 
-	assert.deepEqual(lastGoal(h), { ...yielded, status: "paused", updatedAt: lastGoal(h).updatedAt });
+	assert.deepEqual(lastGoal(h), { ...yielded, version: 3, status: "paused", updatedAt: lastGoal(h).updatedAt });
 	assert.equal(lastGoal(h).objective, yielded.objective);
 	assert.equal(lastGoal(h).yieldReason, yielded.yieldReason);
 	assert.match(h.notices.at(-1), /Goal paused after reload\/restore/);
