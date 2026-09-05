@@ -5,9 +5,11 @@ const { test } = require("node:test");
 const { createJiti } = require("jiti");
 
 const globalPi = "/usr/lib/node_modules/@earendil-works/pi-coding-agent";
-const options = existsSync(globalPi) ? {} : { skip: "Pi 0.81.1 global runtime is unavailable" };
+const options = existsSync(globalPi) ? {} : { skip: "Pi global runtime is unavailable" };
 
-function makeHarness({ runtimeSupport = false, contextTokens } = {}) {
+// The harness models the session as the tree Pi actually keeps: appends hang off the current
+// leaf, and navigation moves that leaf. Without those two facts a discard cannot be observed.
+function makeHarness({ runtimeSupport = false, contextTokens, navigation = "real" } = {}) {
 	const handlers = new Map();
 	const tools = new Map();
 	const commands = new Map();
@@ -15,6 +17,8 @@ function makeHarness({ runtimeSupport = false, contextTokens } = {}) {
 	const sent = [];
 	const notices = [];
 	const compactions = [];
+	const navigations = [];
+	const commandRuns = [];
 	let activeTools = ["create_goal"];
 	let appendThrows = false;
 	let sendThrows = false;
@@ -22,6 +26,22 @@ function makeHarness({ runtimeSupport = false, contextTokens } = {}) {
 	let pendingMessages = false;
 	let idle = true;
 	let tokens = contextTokens;
+	let leafId = null;
+	let nextEntryId = 0;
+
+	function branch() {
+		const byId = new Map(entries.map((entry) => [entry.id, entry]));
+		const path = [];
+		let cursor = leafId;
+		while (cursor) {
+			const entry = byId.get(cursor);
+			if (!entry) break;
+			path.unshift(entry);
+			cursor = entry.parentId;
+		}
+		return path;
+	}
+
 	const pi = {
 		on(name, handler) { handlers.set(name, handler); },
 		registerTool(tool) { tools.set(tool.name, tool); },
@@ -31,15 +51,36 @@ function makeHarness({ runtimeSupport = false, contextTokens } = {}) {
 			if (sendThrows) throw new Error("runtime inactive");
 			sent.push({ message, options: sendOptions });
 		},
+		sendUserMessage(text, sendOptions) {
+			// Pi dispatches a recognized command and returns before building a user message.
+			if (sendOptions?.expandPromptTemplates && text.startsWith("/")) {
+				const space = text.indexOf(" ");
+				const name = space === -1 ? text.slice(1) : text.slice(1, space);
+				const args = space === -1 ? "" : text.slice(space + 1);
+				const command = commands.get(name);
+				if (command) {
+					commandRuns.push(Promise.resolve(command.handler(args, commandCtx)));
+					return;
+				}
+			}
+			throw new Error(`unrecognized internal user message: ${text}`);
+		},
 		appendEntry(customType, data) {
 			if (appendThrows) throw new Error("durability unavailable");
-			entries.push({ type: "custom", customType, data });
+			nextEntryId += 1;
+			const id = `e${nextEntryId}`;
+			entries.push({ id, parentId: leafId, type: "custom", customType, data });
+			leafId = id;
 		},
 		getActiveTools() { return activeTools; },
 		setActiveTools(next) { activeTools = next; },
 	};
 	const ctx = {
-		sessionManager: { getEntries: () => entries, getBranch: () => entries },
+		sessionManager: {
+			getEntries: () => entries,
+			getBranch: () => branch(),
+			getLeafId: () => leafId,
+		},
 		ui: {
 			setStatus() {},
 			notify(message) { notices.push(String(message)); },
@@ -55,8 +96,26 @@ function makeHarness({ runtimeSupport = false, contextTokens } = {}) {
 			if (compactThrows) throw new Error("compaction request failed");
 		};
 	}
+	// Only a command handler receives Pi's command-capable context.
+	const commandCtx = Object.create(ctx);
+	if (navigation !== "absent") {
+		commandCtx.navigateTree = async (targetId, navigateOptions) => {
+			navigations.push({ targetId, options: navigateOptions });
+			if (navigation === "throw") throw new Error("navigation exploded");
+			if (navigation === "cancel") return { cancelled: true };
+			// "noop" models a host that binds navigation but never moves the leaf.
+			if (navigation === "real") leafId = targetId;
+			return { cancelled: false };
+		};
+	}
+
 	return {
-		pi, ctx, handlers, tools, commands, entries, sent, notices, compactions,
+		pi, ctx, commandCtx, handlers, tools, commands, entries, sent, notices, compactions, navigations,
+		leaf: () => leafId,
+		async flush() {
+			while (commandRuns.length) await commandRuns.shift();
+			await Promise.resolve();
+		},
 		setAppendThrows(value) { appendThrows = value; },
 		setSendThrows(value) { sendThrows = value; },
 		setCompactThrows(value) { compactThrows = value; },
@@ -67,7 +126,10 @@ function makeHarness({ runtimeSupport = false, contextTokens } = {}) {
 }
 
 function loadExtension() {
+	// A fresh module per install: the extension keeps process-local state and a live timer
+	// handle, and one session's leftovers must never reach the next test's clock.
 	const jiti = createJiti(resolve(__dirname, "pi-yield-timeout.test.cjs"), {
+		moduleCache: false,
 		alias: {
 			"@mariozechner/pi-tui": `${globalPi}/node_modules/@earendil-works/pi-tui`,
 			"@mariozechner/pi-coding-agent": globalPi,
@@ -83,6 +145,29 @@ async function install(h) {
 
 function lastGoal(h) {
 	return h.entries.at(-1)?.data?.goal;
+}
+
+function timeoutMessages(h) {
+	return h.sent.filter((entry) => entry.message.details.kind === "yield_timeout");
+}
+
+function discardTokenFrom(h) {
+	const content = timeoutMessages(h).at(-1)?.message?.content ?? "";
+	return content.match(/discardToken "([^"]+)"/)?.[1] ?? null;
+}
+
+// One full cycle: create a goal, yield it, and settle so the branch position is captured.
+async function startWait(h, { objective = "await a child", timeoutSeconds = 30 } = {}) {
+	await h.tools.get("create_goal").execute("create", { objective }, null, null, h.ctx);
+	await h.tools.get("yield_goal").execute("yield", { reason: "child running", timeoutSeconds }, null, null, h.ctx);
+	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
+}
+
+// Deliver one fallback wake and enter the recheck turn it starts.
+async function wake(h, t, seconds = 30) {
+	t.mock.timers.tick(seconds * 1000);
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 }
 
 test("yield_goal exposes a 30–600 second timeout range", options, async () => {
@@ -108,205 +193,344 @@ test("yield_goal accepts a bounded custom timeout", options, async (t) => {
 	assert.equal(h.sent[0].message.details.kind, "yield_timeout");
 });
 
-test("timeout context threshold preserves immediate fallback at or below the boundary and when usage is unknown", options, async (t) => {
+test("a fallback wake reports its cumulative wait and offers the discard token", options, async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = makeHarness();
+	await install(h);
+	await startWait(h);
+	h.sent.length = 0;
+
+	t.mock.timers.tick(30_000);
+	const first = timeoutMessages(h).at(-1);
+	assert.equal(first.message.details.goal.waitTimeouts, 1);
+	assert.match(first.message.content, /Wait so far: 1 fallback timeout over/);
+	assert.match(first.message.content, /do not assume it completed/);
+	const token = discardTokenFrom(h);
+	assert.ok(token, "a wake with a captured branch position offers a token");
+
+	// A second wake reports the accumulated count and rotates the token.
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await h.tools.get("yield_goal").execute("yield", { reason: "child still running", timeoutSeconds: 30 }, null, null, h.ctx);
+	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
+	t.mock.timers.tick(30_000);
+	const second = timeoutMessages(h).at(-1);
+	assert.equal(second.message.details.goal.waitTimeouts, 2);
+	assert.match(second.message.content, /Wait so far: 2 fallback timeouts over/);
+	assert.notEqual(discardTokenFrom(h), token, "each wake mints its own token");
+});
+
+test("a wake run that ends without yielding cannot donate its token", options, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = makeHarness();
+	await install(h);
+	await startWait(h);
+	await wake(h, t);
+	const token = discardTokenFrom(h);
+	assert.ok(token);
+
+	// The recheck turn ends without a terminal yield, so pi-goal queues a continuation instead.
+	await h.handlers.get("agent_end")({ messages: [] }, h.ctx);
+	const result = await h.tools.get("yield_goal").execute("yield", { reason: "still waiting", discardToken: token }, null, null, h.ctx);
+	const payload = JSON.parse(result.content[0].text);
+	assert.equal(payload.discard.accepted, false);
+	assert.match(payload.discard.reason, /no fallback timeout wake is open/);
+	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
+	assert.equal(h.navigations.length, 0);
+});
+
+test("a current token rewinds the recheck and keeps the wait durable", options, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = makeHarness();
+	await install(h);
+	await startWait(h);
+	const anchor = h.leaf();
+	await wake(h, t);
+	// The recheck turn writes to the branch before yielding again.
+	h.pi.appendEntry("scratch", { note: "recheck work" });
+	assert.notEqual(h.leaf(), anchor);
+
+	const result = await h.tools.get("yield_goal").execute("yield", { reason: "child still running", timeoutSeconds: 30, discardToken: discardTokenFrom(h) }, null, null, h.ctx);
+	assert.equal(JSON.parse(result.content[0].text).discard.accepted, true);
+	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
+
+	assert.deepEqual(h.navigations.map((entry) => entry.targetId), [anchor]);
+	assert.equal(h.navigations[0].options, undefined, "summarization is never requested");
+	const restated = lastGoal(h);
+	assert.equal(restated.status, "yielded");
+	assert.equal(restated.waitTimeouts, 1, "the wait count survives the rewind");
+	assert.equal(h.leaf(), h.entries.at(-1).id, "the restated goal becomes the next rewind target");
+
+	// The next cycle rewinds to the restated goal, not to the original anchor.
+	const nextTarget = h.leaf();
+	await wake(h, t);
+	await h.tools.get("yield_goal").execute("yield", { reason: "child still running", timeoutSeconds: 30, discardToken: discardTokenFrom(h) }, null, null, h.ctx);
+	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
+	assert.deepEqual(h.navigations.map((entry) => entry.targetId), [anchor, nextTarget]);
+	assert.equal(lastGoal(h).waitTimeouts, 2);
+});
+
+test("a token that is absent, wrong, reused, or over its allowance yields without rewinding", options, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
 	const cases = [
-		{ name: "below", runtimeSupport: true, contextTokens: 99_999 },
-		{ name: "equal", runtimeSupport: true, contextTokens: 100_000 },
-		{ name: "null", runtimeSupport: true, contextTokens: null },
-		{ name: "absent", runtimeSupport: true, contextTokens: undefined },
-		{ name: "unsupported", runtimeSupport: false },
+		{ name: "absent", token: () => undefined, reason: null },
+		{ name: "mismatched", token: () => "wake-999-deadbeef", reason: /not the one this fallback timeout wake issued/ },
 	];
 	for (const current of cases) {
-		const h = makeHarness(current);
+		const h = makeHarness();
 		await install(h);
-		await h.tools.get("create_goal").execute("create", { objective: `fallback ${current.name}` }, null, null, h.ctx);
-		await h.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, h.ctx);
-		h.sent.length = 0;
+		await startWait(h);
+		await wake(h, t);
+		const result = await h.tools.get("yield_goal").execute("yield", { reason: "still waiting", timeoutSeconds: 30, discardToken: current.token() }, null, null, h.ctx);
+		const payload = JSON.parse(result.content[0].text);
+		assert.equal(payload.discard.accepted, false, current.name);
+		assert.equal(payload.discard.requested, current.token() !== undefined, current.name);
+		if (current.reason) assert.match(payload.discard.reason, current.reason, current.name);
+		assert.equal(payload.timeoutAt !== null, true, `${current.name} still arms its fallback`);
+		await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+		await h.flush();
+		assert.equal(h.navigations.length, 0, current.name);
+		assert.equal(lastGoal(h).status, "yielded", current.name);
+	}
 
+	// A token is single-use: the yield that consumed it leaves nothing for the next call.
+	const reuse = makeHarness();
+	await install(reuse);
+	await startWait(reuse);
+	await wake(reuse, t);
+	const token = discardTokenFrom(reuse);
+	await reuse.tools.get("yield_goal").execute("yield", { reason: "first", timeoutSeconds: 30, discardToken: token }, null, null, reuse.ctx);
+	await reuse.handlers.get("agent_settled")({ type: "agent_settled" }, reuse.ctx);
+	await reuse.flush();
+	await reuse.handlers.get("turn_start")({ type: "turn_start" }, reuse.ctx);
+	const replay = await reuse.tools.get("yield_goal").execute("yield", { reason: "second", timeoutSeconds: 30, discardToken: token }, null, null, reuse.ctx);
+	assert.equal(JSON.parse(replay.content[0].text).discard.accepted, false, "a consumed token cannot be replayed");
+	assert.equal(reuse.navigations.length, 1);
+
+	// The allowance is the wake's own interval plus 300 seconds of recheck slack.
+	const late = makeHarness();
+	await install(late);
+	await startWait(late, { timeoutSeconds: 30 });
+	await wake(late, t);
+	t.mock.timers.tick(300_001);
+	const lateResult = await late.tools.get("yield_goal").execute("yield", { reason: "slow recheck", timeoutSeconds: 30, discardToken: discardTokenFrom(late) }, null, null, late.ctx);
+	const latePayload = JSON.parse(lateResult.content[0].text);
+	assert.equal(latePayload.discard.accepted, false);
+	assert.match(latePayload.discard.reason, /past the 330 second discard allowance/);
+	await late.handlers.get("agent_settled")({ type: "agent_settled" }, late.ctx);
+	await late.flush();
+	assert.equal(late.navigations.length, 0);
+});
+
+test("a rewind that does not land keeps the recheck and warns", options, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	for (const navigation of ["noop", "cancel", "throw", "absent"]) {
+		const h = makeHarness({ navigation });
+		await install(h);
+		await startWait(h);
+		const anchor = h.leaf();
+		await wake(h, t);
+		await h.tools.get("yield_goal").execute("yield", { reason: "still waiting", timeoutSeconds: 30, discardToken: discardTokenFrom(h) }, null, null, h.ctx);
+		await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+		await h.flush();
+
+		assert.equal(h.leaf() !== anchor || navigation === "absent", true, navigation);
+		assert.match(h.notices.at(-1), /Goal discard kept the recheck|could not rewind/, navigation);
+		assert.equal(lastGoal(h).status, "yielded", navigation);
+		// The preserved cycle still waits: its fallback timer is intact.
+		h.sent.length = 0;
 		t.mock.timers.tick(30_000);
-		assert.equal(h.compactions.length, 0, current.name);
-		assert.equal(h.sent.length, 1, current.name);
-		assert.equal(h.sent[0].message.details.kind, "yield_timeout", current.name);
+		assert.equal(timeoutMessages(h).length, 1, navigation);
 	}
 });
 
-test("large timeout context compacts once before the existing follow-up", options, async (t) => {
+test("a real external wake ends the wait sequence and revokes discard authority", options, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = makeHarness();
+	await install(h);
+	await startWait(h);
+	await wake(h, t);
+	const token = discardTokenFrom(h);
+	await h.tools.get("yield_goal").execute("yield", { reason: "child still running", timeoutSeconds: 30, discardToken: token }, null, null, h.ctx);
+	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
+	assert.equal(lastGoal(h).waitTimeouts, 1);
+
+	// Native input, then a native turn, is a real external wake rather than a fallback recheck.
+	await h.handlers.get("input")({ type: "input", text: "the child finished", source: "interactive" }, h.ctx);
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	assert.equal(lastGoal(h).status, "active");
+	assert.equal(lastGoal(h).waitStartedAt, undefined, "a real wake ends the sequence");
+
+	const rewindsBefore = h.navigations.length;
+	const next = await h.tools.get("yield_goal").execute("yield", { reason: "a different prerequisite", timeoutSeconds: 30, discardToken: token }, null, null, h.ctx);
+	const payload = JSON.parse(next.content[0].text);
+	assert.equal(payload.discard.accepted, false);
+	assert.equal(payload.goal.waitTimeouts, 0, "the next yield starts a fresh sequence");
+	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
+	assert.equal(h.navigations.length, rewindsBefore, "the revoked token rewinds nothing");
+});
+
+test("a large context compacts once after the yield settles, never at the wake", options, async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const h = makeHarness({ runtimeSupport: true, contextTokens: 100_001 });
 	await install(h);
-	await h.tools.get("create_goal").execute("create", { objective: "compact before reassessing" }, null, null, h.ctx);
+	await h.tools.get("create_goal").execute("create", { objective: "compact after yielding" }, null, null, h.ctx);
 	await h.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, h.ctx);
-	h.sent.length = 0;
+	assert.equal(h.compactions.length, 0, "the tool never compacts inside its own operation");
 
+	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
+	assert.equal(h.compactions.length, 1);
+	h.sent.length = 0;
+	h.compactions[0].onComplete({});
+
+	// The wake itself never evaluates the threshold.
 	t.mock.timers.tick(30_000);
 	assert.equal(h.compactions.length, 1);
-	assert.equal(h.sent.length, 0, "completion owns delivery ordering");
-	h.compactions[0].onComplete({});
-	assert.equal(h.compactions.length, 1);
-	assert.equal(h.sent.length, 1);
-	assert.equal(h.sent[0].message.details.kind, "yield_timeout");
+	assert.equal(timeoutMessages(h).length, 1);
 	assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
-	h.compactions[0].onComplete({});
-	assert.equal(h.sent.length, 1, "a repeated callback cannot redeliver");
 });
 
-test("a busy supported runtime defers threshold evaluation until agent_settled", options, async (t) => {
-	t.mock.timers.enable({ apis: ["setTimeout"] });
-	const h = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
-	await install(h);
-	await h.tools.get("create_goal").execute("create", { objective: "wait until fully settled" }, null, null, h.ctx);
-	await h.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, h.ctx);
-	h.sent.length = 0;
-	h.setIdle(false);
-
-	t.mock.timers.tick(30_000);
-	assert.equal(h.compactions.length, 0);
-	assert.equal(h.sent.length, 0);
-	h.setIdle(true);
-	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
-	assert.equal(h.compactions.length, 1);
-	assert.equal(h.sent.length, 0);
-	h.compactions[0].onComplete({});
-	assert.equal(h.sent.length, 1);
-});
-
-test("input observed before a queued compaction callback suppresses timeout delivery", options, async (t) => {
-	t.mock.timers.enable({ apis: ["setTimeout"] });
-	const h = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
-	await install(h);
-	await h.tools.get("create_goal").execute("create", { objective: "native input wins" }, null, null, h.ctx);
-	await h.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, h.ctx);
-	h.sent.length = 0;
-
-	t.mock.timers.tick(30_000);
-	assert.equal(h.compactions.length, 1);
-	await h.handlers.get("input")({ type: "input", text: "native completion", source: "interactive" }, h.ctx);
-	h.compactions[0].onComplete({});
-	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
-	assert.equal(h.compactions.length, 1);
-	assert.equal(h.sent.length, 0);
-});
-
-test("native and lifecycle changes suppress stale compaction callbacks", options, async (t) => {
+test("settlement rechecks usage, so a context no longer over the threshold is not compacted", options, async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const cases = [
-		{
-			name: "pending message",
-			change: async (h) => h.setPending(true),
-		},
-		{
-			name: "native turn",
-			change: async (h) => h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx),
-		},
-		{
-			name: "pause",
-			change: async (h) => h.commands.get("goal").handler("pause", h.ctx),
-		},
-		{
-			name: "replacement",
-			change: async (h) => h.commands.get("goal").handler("replacement objective", h.ctx),
-		},
-		{
-			name: "budget limiting",
-			budget: 1,
-			startTurn: true,
-			change: async (h) => h.handlers.get("turn_end")({ message: { usage: { totalTokens: 1 } } }, h.ctx),
-		},
-		{
-			name: "shutdown",
-			change: async (h) => h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx),
-		},
+		{ name: "still over", after: 100_001, compactions: 1 },
+		{ name: "back at the boundary", after: 100_000, compactions: 0 },
+		{ name: "unknown", after: null, compactions: 0 },
 	];
-
 	for (const current of cases) {
 		const h = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
 		await install(h);
-		await h.tools.get("create_goal").execute("create", { objective: current.name, tokenBudget: current.budget }, null, null, h.ctx);
-		if (current.startTurn) await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+		await h.tools.get("create_goal").execute("create", { objective: current.name }, null, null, h.ctx);
 		await h.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, h.ctx);
-		h.sent.length = 0;
-		t.mock.timers.tick(30_000);
-		assert.equal(h.compactions.length, 1, current.name);
-
-		await current.change(h);
-		h.compactions[0].onComplete({});
-		h.compactions[0].onError(new Error("late failure"));
-		assert.equal(h.sent.filter((entry) => entry.message.details.kind === "yield_timeout").length, 0, current.name);
-		assert.equal(h.notices.some((notice) => notice.includes("late failure")), false, current.name);
+		h.setContextTokens(current.after);
+		await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+		await h.flush();
+		assert.equal(h.compactions.length, current.compactions, current.name);
 	}
+
+	// A context at or below the threshold when the yield is made latches nothing at all.
+	for (const tokens of [99_999, 100_000, null, undefined]) {
+		const h = makeHarness({ runtimeSupport: true, contextTokens: tokens });
+		await install(h);
+		await h.tools.get("create_goal").execute("create", { objective: `under ${String(tokens)}` }, null, null, h.ctx);
+		await h.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, h.ctx);
+		h.setContextTokens(500_000);
+		await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+		await h.flush();
+		assert.equal(h.compactions.length, 0, String(tokens));
+	}
+
+	// A runtime with no compaction support yields and waits exactly as before.
+	const unsupported = makeHarness();
+	await install(unsupported);
+	await unsupported.tools.get("create_goal").execute("create", { objective: "unsupported" }, null, null, unsupported.ctx);
+	await unsupported.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, unsupported.ctx);
+	await unsupported.handlers.get("agent_settled")({ type: "agent_settled" }, unsupported.ctx);
+	await unsupported.flush();
+	unsupported.sent.length = 0;
+	t.mock.timers.tick(30_000);
+	assert.equal(timeoutMessages(unsupported).length, 1);
 });
 
-test("a rearmed timeout identity ignores the prior compaction callback", options, async (t) => {
+test("a wake waits for an in-flight yield compaction and delivers once", options, async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const h = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
 	await install(h);
-	await h.tools.get("create_goal").execute("create", { objective: "same goal, new yield" }, null, null, h.ctx);
-	await h.tools.get("yield_goal").execute("yield", { reason: "first wait", timeoutSeconds: 30 }, null, null, h.ctx);
-	t.mock.timers.tick(30_000);
-	const firstCompaction = h.compactions[0];
-
-	await h.commands.get("goal").handler("resume", h.ctx);
-	h.sent.length = 0;
-	await h.tools.get("yield_goal").execute("yield", { reason: "second wait", timeoutSeconds: 30 }, null, null, h.ctx);
-	t.mock.timers.tick(30_000);
-	assert.equal(h.compactions.length, 2);
-	firstCompaction.onComplete({});
-	assert.equal(h.sent.length, 0);
-	h.compactions[1].onComplete({});
-	assert.equal(h.sent.filter((entry) => entry.message.details.kind === "yield_timeout").length, 1);
-});
-
-test("compaction completion deferred by a busy runtime enters delivery-only settlement", options, async (t) => {
-	t.mock.timers.enable({ apis: ["setTimeout"] });
-	const h = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
-	await install(h);
-	await h.tools.get("create_goal").execute("create", { objective: "never compact twice" }, null, null, h.ctx);
+	await h.tools.get("create_goal").execute("create", { objective: "wait for compaction" }, null, null, h.ctx);
 	await h.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, h.ctx);
+	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
 	h.sent.length = 0;
-	t.mock.timers.tick(30_000);
-
-	h.setIdle(false);
-	h.compactions[0].onComplete({});
 	assert.equal(h.compactions.length, 1);
-	assert.equal(h.sent.length, 0);
+
+	t.mock.timers.tick(30_000);
+	assert.equal(timeoutMessages(h).length, 0, "a wake never lands mid-compaction");
+	h.compactions[0].onComplete({});
+	assert.equal(timeoutMessages(h).length, 1);
+	h.compactions[0].onComplete({});
+	assert.equal(timeoutMessages(h).length, 1, "a repeated callback cannot redeliver");
+});
+
+test("a busy runtime defers the yield's settlement work until it is idle", options, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
+	await install(h);
+	await h.tools.get("create_goal").execute("create", { objective: "settle when idle" }, null, null, h.ctx);
+	await h.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, h.ctx);
+	h.setIdle(false);
+	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
+	assert.equal(h.compactions.length, 0);
+
+	t.mock.timers.tick(30_000);
+	assert.equal(timeoutMessages(h).length, 0);
 	h.setIdle(true);
 	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+	await h.flush();
 	assert.equal(h.compactions.length, 1);
-	assert.equal(h.sent.length, 1);
+	assert.equal(timeoutMessages(h).length, 0);
+	h.compactions[0].onComplete({});
+	assert.equal(timeoutMessages(h).length, 1);
 });
 
-test("compaction callback and synchronous failures warn and fall back exactly once", options, async (t) => {
+test("compaction failures warn and leave the wait intact", options, async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
-
 	const callbackFailure = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
 	await install(callbackFailure);
 	await callbackFailure.tools.get("create_goal").execute("create", { objective: "callback fallback" }, null, null, callbackFailure.ctx);
 	await callbackFailure.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, callbackFailure.ctx);
+	await callbackFailure.handlers.get("agent_settled")({ type: "agent_settled" }, callbackFailure.ctx);
+	await callbackFailure.flush();
 	callbackFailure.sent.length = 0;
-	t.mock.timers.tick(30_000);
-	callbackFailure.setIdle(false);
 	callbackFailure.compactions[0].onError(new Error("summary failed"));
 	assert.match(callbackFailure.notices.at(-1), /compaction failed: Error: summary failed/);
-	assert.equal(callbackFailure.compactions.length, 1);
-	assert.equal(callbackFailure.sent.length, 0);
-	callbackFailure.setIdle(true);
-	await callbackFailure.handlers.get("agent_settled")({ type: "agent_settled" }, callbackFailure.ctx);
-	assert.equal(callbackFailure.compactions.length, 1);
-	assert.equal(callbackFailure.sent.length, 1);
+	t.mock.timers.tick(30_000);
+	assert.equal(timeoutMessages(callbackFailure).length, 1, "a failed compaction never costs the wake");
 	callbackFailure.compactions[0].onError(new Error("duplicate"));
-	assert.equal(callbackFailure.sent.length, 1);
+	assert.equal(timeoutMessages(callbackFailure).length, 1);
 
 	const synchronousFailure = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
 	await install(synchronousFailure);
 	await synchronousFailure.tools.get("create_goal").execute("create", { objective: "synchronous fallback" }, null, null, synchronousFailure.ctx);
+	await synchronousFailure.setCompactThrows(true);
 	await synchronousFailure.tools.get("yield_goal").execute("yield", { reason: "waiting", timeoutSeconds: 30 }, null, null, synchronousFailure.ctx);
-	synchronousFailure.sent.length = 0;
-	synchronousFailure.setCompactThrows(true);
-	t.mock.timers.tick(30_000);
+	await synchronousFailure.handlers.get("agent_settled")({ type: "agent_settled" }, synchronousFailure.ctx);
+	await synchronousFailure.flush();
 	assert.match(synchronousFailure.notices.at(-1), /compaction failed: Error: compaction request failed/);
-	assert.equal(synchronousFailure.compactions.length, 1);
-	assert.equal(synchronousFailure.sent.length, 1);
+	synchronousFailure.sent.length = 0;
+	t.mock.timers.tick(30_000);
+	assert.equal(timeoutMessages(synchronousFailure).length, 1);
+});
+
+test("lifecycle changes revoke a pending discard and its wake", options, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const cases = [
+		{ name: "pause", change: async (h) => h.commands.get("goal").handler("pause", h.ctx) },
+		{ name: "replacement", change: async (h) => h.commands.get("goal").handler("replacement objective", h.ctx) },
+		{ name: "shutdown", change: async (h) => h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx) },
+		{ name: "reload", change: async (h) => h.handlers.get("session_start")({ reason: "reload" }, h.ctx) },
+	];
+	for (const current of cases) {
+		const h = makeHarness();
+		await install(h);
+		await startWait(h, { objective: current.name });
+		await wake(h, t);
+		await h.tools.get("yield_goal").execute("yield", { reason: "still waiting", timeoutSeconds: 30, discardToken: discardTokenFrom(h) }, null, null, h.ctx);
+		h.sent.length = 0;
+
+		await current.change(h);
+		await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+		await h.flush();
+		assert.equal(h.navigations.length, 0, current.name);
+		t.mock.timers.runAll();
+		assert.equal(timeoutMessages(h).length, 0, current.name);
+	}
 });
 
 test("an invalid timeout leaves the active goal unchanged", options, async (t) => {

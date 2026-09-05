@@ -1,13 +1,13 @@
 export type GoalStatus = "active" | "yielded" | "paused" | "budget_limited" | "complete";
 
-export const GOAL_STATE_VERSION = 2 as const;
+export const GOAL_STATE_VERSION = 3 as const;
 export const MAX_YIELD_REASON_LENGTH = 240;
 export const DEFAULT_YIELD_TIMEOUT_SECONDS = 300;
 export const MIN_YIELD_TIMEOUT_SECONDS = 30;
 export const MAX_YIELD_TIMEOUT_SECONDS = 600;
 
 export type GoalState = {
-	version: 2;
+	version: 3;
 	id: string;
 	objective: string;
 	status: GoalStatus;
@@ -18,9 +18,14 @@ export type GoalState = {
 	updatedAt: number;
 	yieldReason?: string;
 	yieldedAt?: number;
+	// The current wait sequence: one uninterrupted stretch of waiting that may span many
+	// fallback timeouts. It starts at the first yield, survives every timeout recheck and
+	// re-yield, and ends when a real external event wakes the goal.
+	waitStartedAt?: number;
+	waitTimeouts?: number;
 };
 
-type LegacyGoalState = Omit<GoalState, "version" | "status"> & { version: 1; status: Exclude<GoalStatus, "yielded"> };
+type LegacyGoalState = Omit<GoalState, "version" | "status" | "waitStartedAt" | "waitTimeouts"> & { version: 1; status: Exclude<GoalStatus, "yielded"> };
 
 export type GoalEventKind = "active" | "continuation" | "yielded" | "yield_timeout" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
 
@@ -50,7 +55,7 @@ export function migrateGoalState(value: unknown): GoalState | null {
 export function restoreGoalState(value: unknown): RestoreGoalResult {
 	if (!value || typeof value !== "object") return { goal: null, diagnostic: "Goal state is not an object.", migrated: false };
 	const raw = value as Record<string, unknown>;
-	if (raw.version !== 1 && raw.version !== GOAL_STATE_VERSION) {
+	if (raw.version !== 1 && raw.version !== 2 && raw.version !== GOAL_STATE_VERSION) {
 		return { goal: null, diagnostic: `Unsupported goal state version: ${String(raw.version)}.`, migrated: false };
 	}
 	if (typeof raw.id !== "string" || !raw.id || typeof raw.objective !== "string" || !raw.objective.trim()) {
@@ -78,7 +83,13 @@ export function restoreGoalState(value: unknown): RestoreGoalResult {
 		base.yieldReason = normalizeYieldReason(raw.yieldReason)!;
 		base.yieldedAt = finiteNonNegative(raw.yieldedAt) ? raw.yieldedAt : base.updatedAt;
 	}
-	return { goal: base, migrated: raw.version === 1 };
+	// A record written before v3 carries no wait sequence, so it restores as a goal that has
+	// waited through zero timeouts rather than as one with an unknown history.
+	if (finiteNonNegative(raw.waitStartedAt)) {
+		base.waitStartedAt = raw.waitStartedAt;
+		base.waitTimeouts = finiteNonNegative(raw.waitTimeouts) ? Math.floor(raw.waitTimeouts) : 0;
+	}
+	return { goal: base, migrated: raw.version !== GOAL_STATE_VERSION };
 }
 
 export function parseTokenBudget(input: string): { objective: string; tokenBudget: number | null; error?: string } {
@@ -182,7 +193,36 @@ export function createGoalState(objective: string, tokenBudget: number | null, n
 export function yieldGoalState(state: GoalState, reason: unknown, now = Date.now()): GoalState | null {
 	const normalized = normalizeYieldReason(reason);
 	if (state.status !== "active" || !normalized) return null;
-	return { ...state, version: GOAL_STATE_VERSION, status: "yielded", yieldReason: normalized, yieldedAt: now, updatedAt: now };
+	// Re-yielding inside a wait sequence keeps its start and count; a goal whose sequence was
+	// ended by a real external wake starts a fresh one here.
+	const waitStartedAt = state.waitStartedAt ?? now;
+	const waitTimeouts = state.waitStartedAt == null ? 0 : state.waitTimeouts ?? 0;
+	return { ...state, version: GOAL_STATE_VERSION, status: "yielded", yieldReason: normalized, yieldedAt: now, updatedAt: now, waitStartedAt, waitTimeouts };
+}
+
+/** End the current wait sequence. A real external wake, not a fallback timeout, is what ends one. */
+export function endWaitSequence(state: GoalState): GoalState {
+	if (state.waitStartedAt == null && state.waitTimeouts == null) return state;
+	const next = { ...state, version: GOAL_STATE_VERSION };
+	delete next.waitStartedAt;
+	delete next.waitTimeouts;
+	return next;
+}
+
+/** Record one delivered fallback timeout against the current wait sequence. */
+export function countYieldTimeout(state: GoalState, now = Date.now()): GoalState {
+	return {
+		...state,
+		version: GOAL_STATE_VERSION,
+		waitStartedAt: state.waitStartedAt ?? now,
+		waitTimeouts: (state.waitTimeouts ?? 0) + 1,
+	};
+}
+
+/** Whole seconds the current wait sequence has run, or 0 when no sequence is open. */
+export function waitElapsedSeconds(state: GoalState, now = Date.now()): number {
+	if (state.waitStartedAt == null) return 0;
+	return Math.max(0, Math.round((now - state.waitStartedAt) / 1000));
 }
 
 // Alias kept deliberately generic for consumers testing the public lifecycle seam.
@@ -205,7 +245,7 @@ export function accountGoalTurn(state: GoalState, tokenDelta: number, elapsedSec
 	};
 	// The yield turn is charged too; budget exhaustion is the terminal winner.
 	if ((next.status === "active" || next.status === "yielded") && next.tokenBudget != null && next.tokensUsed >= next.tokenBudget) {
-		next = { ...next, status: "budget_limited", yieldReason: undefined, yieldedAt: undefined };
+		next = endWaitSequence({ ...next, status: "budget_limited", yieldReason: undefined, yieldedAt: undefined });
 	}
 	return next;
 }

@@ -21,6 +21,10 @@ import {
 	normalizeYieldReason,
 	escapeUntrusted,
 	enforceYieldExclusivity,
+	countYieldTimeout,
+	endWaitSequence,
+	formatElapsed,
+	waitElapsedSeconds,
 } from "./goal-state";
 import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
 import { createGoalFooter } from "./footer";
@@ -36,17 +40,78 @@ let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
 let yieldTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
 let yieldTimeoutEpoch = 0;
-const YIELD_TIMEOUT_COMPACTION_THRESHOLD = 100_000;
+const CONTEXT_COMPACTION_THRESHOLD = 100_000;
+// Recheck slack on top of the interval that produced a wake. The bound is on the incremental
+// span since the last branch boundary, never on the age of the branch position itself.
+const DISCARD_SPAN_ALLOWANCE_SECONDS = 300;
+const INTERNAL_REWIND_VERB = "__rewind";
 type YieldTimeoutOperation = {
 	epoch: number;
 	goalId: string;
 	yieldedAt: number | undefined;
-	phase: "evaluate" | "deliveryOnly";
+	wakeTimeoutSeconds: number;
 };
 let yieldTimeoutOperation: YieldTimeoutOperation | null = null;
+
+// The branch position a discard rewinds to: the leaf captured once a yield cycle, and any
+// compaction it asked for, has finished. Everything below is process-local by design — a
+// reload converts a yielded goal to paused, so none of it is worth persisting.
+type RewindPoint = { entryId: string; at: number };
+let rewindPoint: RewindPoint | null = null;
+
+// Minted when a fallback timeout is delivered and consumed by the next yield_goal in that run.
+// It is the only authority a discard request is checked against; token text alone proves nothing.
+type DiscardPermit = { token: string; goalId: string; wakeTimeoutSeconds: number; point: RewindPoint };
+let discardPermit: DiscardPermit | null = null;
+
+// The work a terminal yield cannot do inside its own tool call: Pi's manual compaction aborts the
+// active operation, and navigateTree is reachable only from a command handler.
+type PendingYield = {
+	goalId: string;
+	yieldedAt: number | undefined;
+	rewindTo: RewindPoint | null;
+	compactRequested: boolean;
+	nonce: string;
+};
+let pendingYield: PendingYield | null = null;
+let compactionActive = false;
+let mintCounter = 0;
 // Set only for the first provider context after a yielded goal is reactivated.
 // This is transient and intentionally never persisted.
 let resumeMarkerPending = false;
+
+function mint(prefix: string): string {
+	mintCounter += 1;
+	return `${prefix}-${mintCounter}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function clearDiscardState() {
+	discardPermit = null;
+	pendingYield = null;
+	rewindPoint = null;
+}
+
+// A session boundary disowns an in-flight compaction request: its callbacks belong to a
+// runtime this process no longer speaks for, and a stuck flag would block every later wake.
+function clearCompactionTracking() {
+	compactionActive = false;
+}
+
+function readContextTokens(ctx: ExtensionContext): number | null {
+	const getContextUsage = (ctx as any).getContextUsage;
+	if (typeof getContextUsage !== "function") return null;
+	try {
+		const tokens = getContextUsage.call(ctx)?.tokens;
+		return typeof tokens === "number" ? tokens : null;
+	} catch {
+		return null;
+	}
+}
+
+function captureRewindPoint(ctx: ExtensionContext) {
+	const entryId = ctx.sessionManager.getLeafId?.();
+	rewindPoint = typeof entryId === "string" && entryId ? { entryId, at: Date.now() } : null;
+}
 
 // The `content` field is what the LLM sees in the conversation history.
 // Every goal event MUST carry actionable text — never a cryptic marker.
@@ -59,8 +124,16 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 			return continuationPrompt(state);
 		case "yielded":
 			return `The active thread goal has yielded control until a real external event starts another agent turn. Do not continue autonomously and do not poll or set a timer.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nYield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
-		case "yield_timeout":
-			return `The yield fallback timeout elapsed before an external wake-up was observed. Reassess the prerequisite; do not assume it completed. Continue safe work if possible, or yield again only for a concrete future event.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nPrior yield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
+		case "yield_timeout": {
+			const timeouts = state.waitTimeouts ?? 1;
+			const waited = formatElapsed(waitElapsedSeconds(state));
+			// The permit is minted immediately before this message is built, so the token it
+			// offers is always the one the runtime will accept.
+			const offer = discardPermit && discardPermit.goalId === state.id
+				? `\n\nIf this recheck turns up nothing you need to keep, make yield_goal your final call and pass discardToken "${discardPermit.token}". That drops this recheck from the active conversation and keeps waiting. You are the only judge of whether this recheck is worth keeping; nothing else inspects it. Omit discardToken to keep the recheck.`
+				: "";
+			return `The yield fallback timeout elapsed before an external wake-up was observed. Reassess the prerequisite; do not assume it completed. Continue safe work if possible, or yield again only for a concrete future event.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nPrior yield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}\n\nWait so far: ${timeouts} fallback timeout${timeouts === 1 ? "" : "s"} over ${waited}.${offer}`;
+		}
 		case "budget_limited":
 			return budgetLimitPrompt(state);
 		case "paused":
@@ -160,6 +233,16 @@ function retainedFallback(next: GoalState | null): GoalState | null {
 	return { ...next, status: "paused", updatedAt: Date.now() };
 }
 
+// Discard state belongs to one goal's uninterrupted wait. It survives the yielded/active
+// flip of a timeout recheck and nothing else, so every other transition drops it.
+function syncDiscardState(previous: GoalState | null, next: GoalState | null) {
+	const sameWait = next != null
+		&& previous != null
+		&& next.id === previous.id
+		&& (next.status === "active" || next.status === "yielded");
+	if (!sameWait) clearDiscardState();
+}
+
 // Single persistence owner for every lifecycle transition. Callers provide only
 // the transition class; fallback and publication effects are derived here.
 function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null, classification: PersistenceClass): PersistenceOutcome {
@@ -181,6 +264,7 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 			resumeMarkerPending = false;
 		}
 		if (goal?.status !== "yielded") clearYieldTimeout();
+		syncDiscardState(previous, goal);
 		updateStatusBar(ctx);
 		syncGoalTools(pi);
 		return {
@@ -196,6 +280,7 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 		continuationQueued = false;
 	}
 	if (next?.status !== "yielded") clearYieldTimeout();
+	syncDiscardState(previous, next);
 	updateStatusBar(ctx);
 	syncGoalTools(pi);
 	return { persisted: true, goal: next, classification: effectiveClass, mode: "committed" };
@@ -237,8 +322,17 @@ function currentYieldTimeoutGoal(ctx: ExtensionContext, operation: YieldTimeoutO
 
 function deliverYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, operation: YieldTimeoutOperation, state: GoalState) {
 	yieldTimeoutOperation = null;
+	const counted = countYieldTimeout(state);
+	// A wake can only offer a discard when there is a branch position to rewind to.
+	discardPermit = rewindPoint
+		? { token: mint("wake"), goalId: counted.id, wakeTimeoutSeconds: operation.wakeTimeoutSeconds, point: rewindPoint }
+		: null;
+	const outcome = persist(pi, ctx, counted, "retain");
+	reportPersistenceFailure(ctx, "Goal wait accounting is nondurable", outcome);
+	const delivered = outcome.goal ?? counted;
+	if (delivered.status !== "yielded") return;
 	try {
-		emitGoalEvent(pi, "yield_timeout", state, { triggerTurn: true, deliverAs: "followUp" });
+		emitGoalEvent(pi, "yield_timeout", delivered, { triggerTurn: true, deliverAs: "followUp" });
 	} catch (error) {
 		ctx.ui.notify(`Goal yield timeout could not start a fallback turn: ${String(error)}`, "warning");
 	}
@@ -247,45 +341,10 @@ function deliverYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, operation:
 function runYieldTimeoutOperation(pi: ExtensionAPI, ctx: ExtensionContext, operation: YieldTimeoutOperation) {
 	const state = currentYieldTimeoutGoal(ctx, operation);
 	if (!state) return;
-
-	const getContextUsage = (ctx as any).getContextUsage;
-	const compact = (ctx as any).compact;
-	const supportsCompaction = typeof getContextUsage === "function" && typeof compact === "function";
-	if (operation.phase === "evaluate" && !supportsCompaction) {
-		deliverYieldTimeout(pi, ctx, operation, state);
-		return;
-	}
-	if (!ctx.isIdle()) return;
-
-	if (operation.phase === "evaluate") {
-		let tokens: number | null | undefined;
-		try {
-			tokens = getContextUsage.call(ctx)?.tokens;
-		} catch {
-			tokens = undefined;
-		}
-		if (tokens == null || tokens <= YIELD_TIMEOUT_COMPACTION_THRESHOLD) {
-			deliverYieldTimeout(pi, ctx, operation, state);
-			return;
-		}
-
-		operation.phase = "deliveryOnly";
-		const onFailure = (error: unknown) => {
-			if (!currentYieldTimeoutGoal(ctx, operation)) return;
-			ctx.ui.notify(`Goal yield timeout compaction failed: ${String(error)}`, "warning");
-			runYieldTimeoutOperation(pi, ctx, operation);
-		};
-		try {
-			compact.call(ctx, {
-				onComplete: () => runYieldTimeoutOperation(pi, ctx, operation),
-				onError: onFailure,
-			});
-		} catch (error) {
-			onFailure(error);
-		}
-		return;
-	}
-
+	// A wake never interrupts an active run or a compaction this yield requested; both end in
+	// a settle or a callback that re-enters here. Settlement order is handled at agent_settled,
+	// which runs the yield's own post-work before any due wake.
+	if (!ctx.isIdle() || compactionActive) return;
 	deliverYieldTimeout(pi, ctx, operation, state);
 }
 
@@ -298,11 +357,122 @@ function armYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalSta
 	yieldTimeoutHandle = setTimeout(() => {
 		if (yieldTimeoutEpoch !== epoch) return;
 		yieldTimeoutHandle = null;
-		const operation: YieldTimeoutOperation = { epoch, goalId, yieldedAt, phase: "evaluate" };
+		const operation: YieldTimeoutOperation = { epoch, goalId, yieldedAt, wakeTimeoutSeconds: timeoutSeconds };
 		yieldTimeoutOperation = operation;
 		runYieldTimeoutOperation(pi, ctx, operation);
 	}, timeoutSeconds * 1000);
 	return timeoutAt;
+}
+
+// Freshness and span are the whole check. What the recheck contained is the agent's call.
+function evaluateDiscardRequest(permit: DiscardPermit | null, token: string, goalId: string, now: number): { point: RewindPoint | null; reason: string | null } {
+	if (!token) return { point: null, reason: null };
+	if (!permit || permit.goalId !== goalId) return { point: null, reason: "no fallback timeout wake is open for this goal" };
+	if (permit.token !== token) return { point: null, reason: "the token is not the one this fallback timeout wake issued" };
+	const allowanceSeconds = permit.wakeTimeoutSeconds + DISCARD_SPAN_ALLOWANCE_SECONDS;
+	if (now - permit.point.at > allowanceSeconds * 1000) {
+		return { point: null, reason: `this wait ran past the ${allowanceSeconds} second discard allowance` };
+	}
+	return { point: permit.point, reason: null };
+}
+
+function currentPendingYieldGoal(ctx: ExtensionContext, pending: PendingYield): GoalState | null {
+	if (
+		!goal
+		|| goal.id !== pending.goalId
+		|| goal.status !== "yielded"
+		|| goal.yieldedAt !== pending.yieldedAt
+		|| ctx.hasPendingMessages()
+	) {
+		return null;
+	}
+	return goal;
+}
+
+// The last step of a yield cycle: rewind if the agent asked for it, then leave the branch
+// position and the context size the next wait will start from.
+function settlePendingYield(pi: ExtensionAPI, ctx: ExtensionContext, pending: PendingYield) {
+	if (!currentPendingYieldGoal(ctx, pending)) {
+		pendingYield = null;
+		return;
+	}
+	if (!ctx.isIdle() || compactionActive) return;
+	if (pending.rewindTo) {
+		// Pi supplies navigateTree only to a command handler, and a recognized command sent this
+		// way is dispatched without appending a user message.
+		try {
+			(pi as any).sendUserMessage(`/goal ${INTERNAL_REWIND_VERB} ${pending.nonce}`, { expandPromptTemplates: true });
+			return;
+		} catch (error) {
+			ctx.ui.notify(`Goal discard kept the recheck: ${String(error)}`, "warning");
+		}
+	}
+	pendingYield = null;
+	captureRewindPoint(ctx);
+	runPendingCompaction(pi, ctx, pending);
+}
+
+async function runRewindCommand(pi: ExtensionAPI, ctx: ExtensionContext, nonce: string) {
+	const pending = pendingYield;
+	if (!pending || !pending.rewindTo || pending.nonce !== nonce) return;
+	pendingYield = null;
+	if (!currentPendingYieldGoal(ctx, pending)) return;
+	const target = pending.rewindTo.entryId;
+	const navigate = (ctx as any).navigateTree;
+	let landed = false;
+	if (typeof navigate !== "function") {
+		ctx.ui.notify("Goal discard kept the recheck: this runtime cannot navigate the session tree.", "warning");
+	} else {
+		try {
+			const result = await navigate.call(ctx, target);
+			// A host that binds a no-op navigateTree reports success without moving the leaf,
+			// so the leaf itself is the postcondition.
+			landed = !result?.cancelled && ctx.sessionManager.getLeafId?.() === target;
+		} catch (error) {
+			ctx.ui.notify(`Goal discard could not rewind: ${String(error)}`, "warning");
+		}
+		if (!landed) ctx.ui.notify("Goal discard kept the recheck: the session did not rewind to the yield point.", "warning");
+	}
+	if (landed && goal) {
+		// Restate the yielded goal on the rewound branch: the entry written by the discarding
+		// yield left the active branch with it, and its wait counters went too.
+		const outcome = persist(pi, ctx, goal, "retain");
+		reportPersistenceFailure(ctx, "Goal discard rewound but its state is nondurable", outcome);
+	}
+	captureRewindPoint(ctx);
+	runPendingCompaction(pi, ctx, pending);
+}
+
+function runPendingCompaction(pi: ExtensionAPI, ctx: ExtensionContext, pending: PendingYield) {
+	if (!pending.compactRequested) return;
+	const compact = (ctx as any).compact;
+	if (typeof compact !== "function") return;
+	// A rewind or an automatic compaction may already have brought the context back down.
+	const tokens = readContextTokens(ctx);
+	if (tokens == null || tokens <= CONTEXT_COMPACTION_THRESHOLD) return;
+	compactionActive = true;
+	const finish = () => {
+		compactionActive = false;
+		captureRewindPoint(ctx);
+		const operation = yieldTimeoutOperation;
+		if (operation) runYieldTimeoutOperation(pi, ctx, operation);
+	};
+	try {
+		compact.call(ctx, {
+			onComplete: () => {
+				if (!compactionActive) return;
+				finish();
+			},
+			onError: (error: unknown) => {
+				if (!compactionActive) return;
+				ctx.ui.notify(`Goal yield compaction failed: ${String(error)}`, "warning");
+				finish();
+			},
+		});
+	} catch (error) {
+		compactionActive = false;
+		ctx.ui.notify(`Goal yield compaction failed: ${String(error)}`, "warning");
+	}
 }
 
 function continuationPrompt(state: GoalState): string {
@@ -479,6 +649,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			"Provide a concise reason naming the external prerequisite (for example child completion, provider result, authorization, or a future user reply).",
 			"yield_goal uses a five-minute fallback timeout by default; timeout expiry only requests a recheck and is not evidence that the prerequisite completed.",
 			"Set yield_goal timeoutSeconds only when the expected external event needs a different bounded recheck window between 30 and 600 seconds.",
+			"Pass discardToken only with the token from the fallback timeout message you are answering, and only when that recheck produced nothing you need later; it drops the recheck from the active conversation while the wait continues.",
 			"yield_goal is terminal: make it the sole final tool action and do not call subagent_wait, ask_user_question, or another tool afterward.",
 		],
 		parameters: {
@@ -486,6 +657,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			properties: {
 				reason: { type: "string", description: "Bounded diagnostic reason for the external prerequisite." },
 				timeoutSeconds: { type: "integer", minimum: 30, maximum: 600, description: "Optional one-shot fallback timeout in seconds; defaults to 300." },
+				discardToken: { type: "string", description: "Optional token from the fallback timeout message being answered. Supply it only when this recheck produced nothing worth keeping; the recheck is then dropped from the active conversation and the wait continues." },
 			},
 			required: ["reason"],
 			additionalProperties: false,
@@ -502,18 +674,38 @@ export default function piGoal(pi: ExtensionAPI) {
 			if (parsedTimeout.error || parsedTimeout.timeoutSeconds == null) {
 				throw new Error(parsedTimeout.error ?? "Invalid yield timeout.");
 			}
+			// The wake permit authorizes at most one yield, so this call consumes it whether or
+			// not it asks to discard.
+			const permit = discardPermit;
+			discardPermit = null;
+			const requestedToken = typeof (params as any).discardToken === "string" ? (params as any).discardToken.trim() : "";
+			const discard = evaluateDiscardRequest(permit, requestedToken, goal.id, Date.now());
+
 			const next = yieldGoalState(goal, normalized);
 			if (!next) {
 				throw new Error("Unable to yield the current goal.");
 			}
+			// Latch the context size here, but leave compaction to settlement: Pi's manual
+			// compaction aborts the active operation, which is this yield itself.
+			const contextTokens = readContextTokens(ctx);
 			const outcome = persist(pi, ctx, next, "revoke");
 			const timeoutAt = outcome.persisted ? armYieldTimeout(pi, ctx, next, parsedTimeout.timeoutSeconds) : null;
+			if (outcome.persisted) {
+				pendingYield = {
+					goalId: next.id,
+					yieldedAt: next.yieldedAt,
+					rewindTo: discard.point,
+					compactRequested: contextTokens != null && contextTokens > CONTEXT_COMPACTION_THRESHOLD,
+					nonce: mint("rewind"),
+				};
+			}
+			const discardResult = { requested: requestedToken !== "", accepted: discard.point != null, reason: discard.reason };
 			// Do not publish a custom marker here: Pi queues sendMessage() as steer
 			// while streaming, which would turn this terminal action into a wake-up.
 			// The tool result details and status bar are the observable handoff.
 			return {
-				content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, terminal: true, terminalAction: "yield", timeoutSeconds: parsedTimeout.timeoutSeconds, timeoutAt, persisted: outcome.persisted, diagnostic: outcome.diagnostic ?? null }, null, 2) }],
-				details: { goal: outcome.goal, terminal: true, terminalAction: "yield", timeoutSeconds: parsedTimeout.timeoutSeconds, timeoutAt, persisted: outcome.persisted, diagnostic: outcome.diagnostic },
+				content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, terminal: true, terminalAction: "yield", timeoutSeconds: parsedTimeout.timeoutSeconds, timeoutAt, persisted: outcome.persisted, discard: discardResult, diagnostic: outcome.diagnostic ?? null }, null, 2) }],
+				details: { goal: outcome.goal, terminal: true, terminalAction: "yield", timeoutSeconds: parsedTimeout.timeoutSeconds, timeoutAt, persisted: outcome.persisted, discard: discardResult, diagnostic: outcome.diagnostic },
 				terminate: true,
 			} as any;
 		},
@@ -600,6 +792,13 @@ export default function piGoal(pi: ExtensionAPI) {
 			const trimmed = args.trim();
 			const now = Date.now();
 
+			// pi-goal's own rewind bridge. It is absent from the completion list and acts only on
+			// the nonce of a rewind this process is currently waiting to perform.
+			if (trimmed === INTERNAL_REWIND_VERB || trimmed.startsWith(`${INTERNAL_REWIND_VERB} `)) {
+				await runRewindCommand(pi, ctx, trimmed.slice(INTERNAL_REWIND_VERB.length).trim());
+				return;
+			}
+
 			if (!trimmed || trimmed === "status") {
 				if (!goal) ctx.ui.notify("Usage: /goal [--tokens 50k] <objective>", "info");
 				else ctx.ui.notify(`${statusLine(goal)}\nObjective: ${goal.objective}${goal.status === "yielded" ? `\nWaiting for: ${goal.yieldReason}` : ""}\nStatus bar: ${statusBarEnabled ? "on" : "off"}`, "info");
@@ -662,6 +861,8 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("session_start", (event, ctx) => {
 		clearYieldTimeout();
+		clearDiscardState();
+		clearCompactionTracking();
 		goalFooterInstalled = false;
 		const restored = latestStateFromSession(ctx);
 		goal = restored.goal;
@@ -721,7 +922,9 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.on("input", () => {
 		// Input is observed before prompt preflight, including input released
 		// from Pi's compaction queue, so native intent wins over timeout work.
+		// pi-goal's own rewind command is dispatched before this event and never reaches here.
 		if (goal?.status === "yielded") clearYieldTimeout();
+		if (goal) clearDiscardState();
 	});
 
 	pi.on("turn_start", (_event, ctx) => {
@@ -729,7 +932,11 @@ export default function piGoal(pi: ExtensionAPI) {
 		// wakes a yielded goal without manufacturing another queue item.
 		if (goal?.status === "yielded") {
 			clearYieldTimeout();
-			const resumed = resumeGoalState(goal);
+			// A wake this extension did not schedule is a real external event, and that is what
+			// ends a wait sequence. A fallback wake continues the one already running.
+			const fallbackWake = discardPermit?.goalId === goal.id;
+			if (!fallbackWake) clearDiscardState();
+			const resumed = resumeGoalState(fallbackWake ? goal : endWaitSequence(goal));
 			if (resumed) {
 				// Persist while the in-memory authority is still yielded. If the
 				// durable witness rejects the transition, the owner rolls back yielded.
@@ -766,6 +973,9 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("agent_end", (event, ctx) => {
 		if (!goal || goal.status !== "active") return;
+		// The run started by a fallback wake is over and did not yield, so its permit expires
+		// here rather than travelling into the continuation this handler queues.
+		discardPermit = null;
 		if (agentRunWasAborted(event.messages)) {
 			const paused = { ...goal, status: "paused" as const, updatedAt: Date.now() };
 			const outcome = persist(pi, ctx, paused, "revoke");
@@ -783,11 +993,15 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
+		const pending = pendingYield;
+		if (pending) settlePendingYield(pi, ctx, pending);
 		const operation = yieldTimeoutOperation;
 		if (operation) runYieldTimeoutOperation(pi, ctx, operation);
 	});
 
 	pi.on("session_shutdown", () => {
 		clearYieldTimeout();
+		clearDiscardState();
+		clearCompactionTracking();
 	});
 }
