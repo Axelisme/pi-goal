@@ -138,8 +138,8 @@ test("malformed and invalid yielded v2 records restore fail-safe without acquiri
 		assert.equal(lastGoal(h), invalid, "invalid durable witness is not replaced by an autonomous state");
 		assert.equal(h.sent.length, 0);
 		assert.equal(h.handlers.get("agent_end")({}, h.ctx), undefined);
-		const context = h.handlers.get("context")({ messages: [{ role: "assistant", content: [{ type: "text", text: "unrelated" }] }] }, h.ctx);
-		assert.equal(context.messages.length, 1);
+		const beforeStart = h.handlers.get("before_agent_start")({ prompt: "unrelated" }, h.ctx);
+		assert.equal(beforeStart, undefined);
 		assert.match(h.notices.at(-1), /Goal state ignored safely/);
 	}
 });
@@ -197,31 +197,33 @@ test("registered goal commands transition a yielded goal with one matching publi
 	}
 });
 
-test("a later yielded turn preserves unrelated assistant messages, injects one resume marker, and queues one continuation", options, async () => {
+test("a later yielded run injects one persistent resume marker and queues one continuation", options, async () => {
 	const h = makeHarness();
 	await install(h);
 	await createYielded(h, "continue the audit", "waiting for the test provider");
 
-	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	const injected = h.handlers.get("before_agent_start")({ prompt: "external event" }, h.ctx);
 	assert.equal(lastGoal(h).status, "active");
 	assert.equal(lastGoal(h).objective, "continue the audit");
 	assert.equal(lastGoal(h).yieldReason, "waiting for the test provider");
+	assert.equal(injected.message.customType, "pi-goal-event");
+	assert.equal(injected.message.details.kind, "resumed");
+	assert.equal(injected.message.details.resume, true);
+	assert.match(injected.message.content, /waiting for the test provider/);
+	assert.equal(injected.message.details.goal.objective, "continue the audit");
 
-	const unrelatedAssistant = { role: "assistant", content: [{ type: "text", text: "unrelated assistant response" }] };
-	const priorMessages = [
-		{ role: "user", content: [{ type: "text", text: "external event" }] },
-		unrelatedAssistant,
+	const priorMessages = [{ role: "user", content: [{ type: "text", text: "external event" }] }];
+	const persistentMarker = { role: "custom", ...injected.message };
+	const firstProviderMessages = [...priorMessages, persistentMarker];
+	const laterProviderMessages = [
+		...firstProviderMessages,
+		{ role: "assistant", content: [{ type: "text", text: "unrelated assistant response" }] },
+		{ role: "toolResult", content: [{ type: "text", text: "tool result" }] },
 	];
-	const firstContext = h.handlers.get("context")({ messages: priorMessages }, h.ctx);
-	assert.deepEqual(firstContext.messages.slice(0, 2), priorMessages);
-	assert.equal(firstContext.messages[2].role, "custom");
-	assert.equal(firstContext.messages[2].details.kind, "resumed");
-	assert.equal(firstContext.messages[2].details.resume, true);
-	assert.match(firstContext.messages[2].content, /waiting for the test provider/);
-	assert.equal(firstContext.messages[2].details.goal.objective, "continue the audit");
+	assert.deepEqual(laterProviderMessages.slice(0, firstProviderMessages.length), firstProviderMessages);
+	assert.equal(h.handlers.get("before_agent_start")({ prompt: "already active" }, h.ctx), undefined, "one wake injects exactly one marker");
 
-	const secondContext = h.handlers.get("context")({ messages: priorMessages }, h.ctx);
-	assert.deepEqual(secondContext.messages, priorMessages, "resume marker is consumed exactly once");
+	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 	h.handlers.get("agent_end")({}, h.ctx);
 	h.handlers.get("agent_end")({}, h.ctx);
 	await flushMicrotasks();
@@ -236,14 +238,11 @@ test("a yielded resume with a pending same-run message injects one marker and no
 	await install(h);
 	await createYielded(h, "resume the same run", "waiting for a pending event");
 
-	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
-	const assistant = { role: "assistant", content: [{ type: "text", text: "keep this assistant message" }] };
-	const messages = [assistant];
-	const resumed = h.handlers.get("context")({ messages }, h.ctx);
-	assert.deepEqual(resumed.messages[0], assistant);
-	assert.equal(resumed.messages.filter((message) => message.details?.resume === true).length, 1);
-	assert.deepEqual(h.handlers.get("context")({ messages }, h.ctx).messages, messages);
+	const resumed = h.handlers.get("before_agent_start")({ prompt: "pending event" }, h.ctx);
+	assert.equal(resumed.message.details.resume, true);
+	assert.equal(h.handlers.get("before_agent_start")({ prompt: "already active" }, h.ctx), undefined);
 
+	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 	h.handlers.get("agent_end")({}, h.ctx);
 	await flushMicrotasks();
 	assert.equal(h.sent.length, 0, "pending public Pi messages suppress plugin continuation");

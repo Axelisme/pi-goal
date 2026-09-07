@@ -164,10 +164,16 @@ async function startWait(h, { objective = "await a child", timeoutSeconds = 30 }
 	await h.flush();
 }
 
+async function startAgent(h, prompt = "external event") {
+	const injected = await h.handlers.get("before_agent_start")({ type: "before_agent_start", prompt }, h.ctx);
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	return injected;
+}
+
 // Deliver one fallback wake and enter the recheck turn it starts.
 async function wake(h, t, seconds = 30) {
 	t.mock.timers.tick(seconds * 1000);
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await startAgent(h, "yield timeout");
 }
 
 test("yield_goal exposes a 30–600 second timeout range", options, async () => {
@@ -209,7 +215,7 @@ test("a fallback wake reports its cumulative wait and offers the discard token",
 	assert.ok(token, "a wake with a captured branch position offers a token");
 
 	// A second wake reports the accumulated count and rotates the token.
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await startAgent(h, "second yield timeout");
 	await h.tools.get("yield_goal").execute("yield", { reason: "child still running", timeoutSeconds: 30 }, null, null, h.ctx);
 	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
 	await h.flush();
@@ -305,7 +311,7 @@ test("a token that is absent, wrong, reused, or over its allowance yields withou
 	await reuse.tools.get("yield_goal").execute("yield", { reason: "first", timeoutSeconds: 30, discardToken: token }, null, null, reuse.ctx);
 	await reuse.handlers.get("agent_settled")({ type: "agent_settled" }, reuse.ctx);
 	await reuse.flush();
-	await reuse.handlers.get("turn_start")({ type: "turn_start" }, reuse.ctx);
+	await startAgent(reuse, "second yield timeout");
 	const replay = await reuse.tools.get("yield_goal").execute("yield", { reason: "second", timeoutSeconds: 30, discardToken: token }, null, null, reuse.ctx);
 	assert.equal(JSON.parse(replay.content[0].text).discard.accepted, false, "a consumed token cannot be replayed");
 	assert.equal(reuse.navigations.length, 1);
@@ -361,7 +367,7 @@ test("a real external wake ends the wait sequence and revokes discard authority"
 
 	// Native input, then a native turn, is a real external wake rather than a fallback recheck.
 	await h.handlers.get("input")({ type: "input", text: "the child finished", source: "interactive" }, h.ctx);
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await startAgent(h, "the child finished");
 	assert.equal(lastGoal(h).status, "active");
 	assert.equal(lastGoal(h).waitStartedAt, undefined, "a real wake ends the sequence");
 
@@ -560,7 +566,7 @@ test("a queued native message at the deadline suppresses the fallback wake-up", 
 	h.setPending(true);
 	t.mock.timers.tick(30_000);
 	assert.equal(h.sent.length, 0);
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await startAgent(h, "queued native message");
 	assert.equal(lastGoal(h).status, "active");
 });
 
@@ -572,7 +578,7 @@ test("a native turn before the deadline cancels the fallback wake-up", options, 
 	await h.tools.get("yield_goal").execute("yield", { reason: "waiting for completion", timeoutSeconds: 30 }, null, null, h.ctx);
 	h.sent.length = 0;
 
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await startAgent(h, "native turn");
 	assert.equal(lastGoal(h).status, "active");
 	t.mock.timers.runAll();
 	assert.equal(h.sent.length, 0);
@@ -663,20 +669,21 @@ test("yield_goal stays terminal, then its default timeout wakes the same yielded
 
 	const result = await h.tools.get("yield_goal").execute("yield", { reason: "waiting for a child" }, null, null, h.ctx);
 	assert.equal(result.terminate, true);
-	assert.equal(JSON.parse(result.content[0].text).timeoutSeconds, 300);
+	assert.equal(JSON.parse(result.content[0].text).timeoutSeconds, 270);
 	assert.equal(lastGoal(h).status, "yielded");
 	assert.equal(h.sent.length, 0, "yield itself must not manufacture a wake-up");
 
-	t.mock.timers.tick(299_999);
+	t.mock.timers.tick(269_999);
 	assert.equal(h.sent.length, 0);
 	t.mock.timers.tick(1);
 	assert.equal(h.sent.length, 1);
 	assert.equal(h.sent[0].message.details.kind, "yield_timeout");
 	assert.equal(h.sent[0].options.triggerTurn, true);
 	assert.equal(h.sent[0].options.deliverAs, "followUp");
-	assert.equal(lastGoal(h).status, "yielded", "turn_start remains the authority acquisition seam");
+	assert.equal(lastGoal(h).status, "yielded", "timeout delivery does not acquire authority");
 
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	const injected = await startAgent(h, "default yield timeout");
+	assert.equal(injected.message.details.resume, true);
 	assert.equal(lastGoal(h).status, "active");
 	t.mock.timers.runAll();
 	assert.equal(h.sent.length, 1, "the timeout is one-shot");

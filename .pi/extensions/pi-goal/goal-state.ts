@@ -2,7 +2,7 @@ export type GoalStatus = "active" | "yielded" | "paused" | "budget_limited" | "c
 
 export const GOAL_STATE_VERSION = 3 as const;
 export const MAX_YIELD_REASON_LENGTH = 240;
-export const DEFAULT_YIELD_TIMEOUT_SECONDS = 300;
+export const DEFAULT_YIELD_TIMEOUT_SECONDS = 270;
 export const MIN_YIELD_TIMEOUT_SECONDS = 30;
 export const MAX_YIELD_TIMEOUT_SECONDS = 600;
 

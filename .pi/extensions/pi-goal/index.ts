@@ -76,9 +76,6 @@ type PendingYield = {
 let pendingYield: PendingYield | null = null;
 let compactionActive = false;
 let mintCounter = 0;
-// Set only for the first provider context after a yielded goal is reactivated.
-// This is transient and intentionally never persisted.
-let resumeMarkerPending = false;
 
 function mint(prefix: string): string {
 	mintCounter += 1;
@@ -261,7 +258,6 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 			// defensible accounting/objective data but pauses autonomous authority.
 			goal = effectiveClass === "retain" ? retainedFallback(next) : next;
 			continuationQueued = false;
-			resumeMarkerPending = false;
 		}
 		if (goal?.status !== "yielded") clearYieldTimeout();
 		syncDiscardState(previous, goal);
@@ -762,23 +758,32 @@ export default function piGoal(pi: ExtensionAPI) {
 		return message === event.message ? undefined : { message: message as any };
 	});
 
-	pi.on("context", (event) => {
-		let messages = event.messages as any[];
-		if (resumeMarkerPending && goal?.status === "active") {
-			resumeMarkerPending = false;
-			messages = [
-				...messages,
-				{
-					role: "custom",
-					customType: EVENT_TYPE,
-					content: resumeMarker(goal),
-					display: true,
-					details: { kind: "resumed", goal, resume: true, timestamp: Date.now() },
-					timestamp: Date.now(),
-				},
-			] as any;
+	pi.on("before_agent_start", (_event, ctx) => {
+		if (goal?.status !== "yielded") return;
+
+		clearYieldTimeout();
+		// A wake this extension did not schedule is a real external event, and that is what
+		// ends a wait sequence. A fallback wake continues the one already running.
+		const fallbackWake = discardPermit?.goalId === goal.id;
+		if (!fallbackWake) clearDiscardState();
+		const resumed = resumeGoalState(fallbackWake ? goal : endWaitSequence(goal));
+		if (!resumed) return;
+
+		// Persist while the in-memory authority is still yielded. If the durable witness
+		// rejects the transition, leave yielded and inject no autonomous instruction.
+		const outcome = persist(pi, ctx, resumed, "acquire");
+		if (!outcome.persisted) {
+			reportPersistenceFailure(ctx, "Goal resume remained yielded and nondurable", outcome);
+			return;
 		}
-		return { messages };
+		return {
+			message: {
+				customType: EVENT_TYPE,
+				content: resumeMarker(resumed),
+				display: true,
+				details: { kind: "resumed", goal: resumed, resume: true, timestamp: Date.now() },
+			},
+		};
 	});
 
 	pi.registerCommand("goal", {
@@ -868,7 +873,6 @@ export default function piGoal(pi: ExtensionAPI) {
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
 		continuationQueued = false;
-		resumeMarkerPending = false;
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
 		// Keep create_goal available, and hide read/update tools unless there is an active goal to pursue.
@@ -927,28 +931,7 @@ export default function piGoal(pi: ExtensionAPI) {
 		if (goal) clearDiscardState();
 	});
 
-	pi.on("turn_start", (_event, ctx) => {
-		// A native queued event is authoritative: it starts the next turn and
-		// wakes a yielded goal without manufacturing another queue item.
-		if (goal?.status === "yielded") {
-			clearYieldTimeout();
-			// A wake this extension did not schedule is a real external event, and that is what
-			// ends a wait sequence. A fallback wake continues the one already running.
-			const fallbackWake = discardPermit?.goalId === goal.id;
-			if (!fallbackWake) clearDiscardState();
-			const resumed = resumeGoalState(fallbackWake ? goal : endWaitSequence(goal));
-			if (resumed) {
-				// Persist while the in-memory authority is still yielded. If the
-				// durable witness rejects the transition, the owner rolls back yielded.
-				const outcome = persist(pi, ctx, resumed, "acquire");
-				if (outcome.persisted) {
-					resumeMarkerPending = true;
-				} else {
-					resumeMarkerPending = false;
-					reportPersistenceFailure(ctx, "Goal resume remained yielded and nondurable", outcome);
-				}
-			}
-		}
+	pi.on("turn_start", () => {
 		activeTurnStartedAt = Date.now();
 		activeGoalThisTurnId = goal?.status === "active" ? goal.id : null;
 	});
