@@ -212,18 +212,57 @@ test("a later yielded run injects one persistent resume marker and queues one co
 	assert.match(injected.message.content, /waiting for the test provider/);
 	assert.equal(injected.message.details.goal.objective, "continue the audit");
 
-	const priorMessages = [{ role: "user", content: [{ type: "text", text: "external event" }] }];
-	const persistentMarker = { role: "custom", ...injected.message };
-	const firstProviderMessages = [...priorMessages, persistentMarker];
-	const laterProviderMessages = [
-		...firstProviderMessages,
-		{ role: "assistant", content: [{ type: "text", text: "unrelated assistant response" }] },
-		{ role: "toolResult", content: [{ type: "text", text: "tool result" }] },
+	// Pi's public before_agent_start result is converted into a custom Agent message before
+	// the first provider request. Use the real agent loop to verify the message is retained
+	// across the second request in the same run, rather than asserting a hand-built prefix.
+	const { Agent } = await import(`${globalPi}/node_modules/@earendil-works/pi-agent-core/dist/index.js`);
+	const { createAssistantMessageEventStream } = await import(`${globalPi}/node_modules/@earendil-works/pi-ai/dist/index.js`);
+	const model = { id: "resume-contract", name: "resume-contract", api: "test", provider: "test", reasoning: false };
+	const providerContexts = [];
+	let providerCalls = 0;
+	const streamFn = (_model, context) => {
+		providerCalls += 1;
+		providerContexts.push(structuredClone(context.messages));
+		const stream = createAssistantMessageEventStream();
+		const toolUse = providerCalls === 1;
+		const message = {
+			role: "assistant",
+			content: toolUse
+				? [{ type: "toolCall", id: "inspect-goal", name: "get_goal", arguments: {} }]
+				: [{ type: "text", text: "continue" }],
+			api: "test", provider: "test", model: model.id,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: toolUse ? "toolUse" : "stop", timestamp: Date.now(),
+		};
+		queueMicrotask(() => { stream.push({ type: "start", partial: message }); stream.push({ type: "done", reason: message.stopReason, message }); });
+		return stream;
+	};
+	const agentTools = new Map([...h.tools.values()].map((definition) => [definition.name, {
+		...definition,
+		execute: (id, params, signal, onUpdate) => definition.execute(id, params, signal, onUpdate, h.ctx),
+	}]));
+	const agent = new Agent({
+		initialState: { systemPrompt: "goal", model, thinkingLevel: "off", tools: [...agentTools.values()] },
+		convertToLlm: (messages) => messages,
+		streamFn,
+	});
+	const persistentMarker = { role: "custom", ...injected.message, timestamp: Date.now() };
+	const wakeMessages = [
+		{ role: "user", content: [{ type: "text", text: "external event" }] },
+		persistentMarker,
 	];
-	assert.deepEqual(laterProviderMessages.slice(0, firstProviderMessages.length), firstProviderMessages);
+	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await agent.prompt(wakeMessages);
+	assert.equal(providerCalls, 2, "the fake provider makes two requests in one agent run");
+	for (const messages of providerContexts) {
+		const markers = messages.filter((message) => message.role === "custom" && message.customType === "pi-goal-event" && message.details?.resume === true);
+		assert.equal(markers.length, 1, "each provider request sees exactly one resume marker");
+		assert.deepEqual(markers[0], persistentMarker);
+	}
+	assert.deepEqual(providerContexts[0].slice(0, wakeMessages.length), wakeMessages);
+	assert.deepEqual(providerContexts[1].slice(0, wakeMessages.length), wakeMessages, "the later request keeps the marker in its prior prefix");
 	assert.equal(h.handlers.get("before_agent_start")({ prompt: "already active" }, h.ctx), undefined, "one wake injects exactly one marker");
 
-	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 	h.handlers.get("agent_end")({}, h.ctx);
 	h.handlers.get("agent_end")({}, h.ctx);
 	await flushMicrotasks();

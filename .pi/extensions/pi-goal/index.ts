@@ -643,7 +643,7 @@ export default function piGoal(pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Call yield_goal only when no blocking tool is awaiting an in-run answer, no synchronous autonomous work remains, and a concrete future event can start another turn.",
 			"Provide a concise reason naming the external prerequisite (for example child completion, provider result, authorization, or a future user reply).",
-			"yield_goal uses a five-minute fallback timeout by default; timeout expiry only requests a recheck and is not evidence that the prerequisite completed.",
+			"yield_goal uses a 270-second fallback timeout by default to recheck before a five-minute cache-heartbeat boundary; timeout expiry only requests a recheck and is not evidence that the prerequisite completed.",
 			"Set yield_goal timeoutSeconds only when the expected external event needs a different bounded recheck window between 30 and 600 seconds.",
 			"Pass discardToken only with the token from the fallback timeout message you are answering, and only when that recheck produced nothing you need later; it drops the recheck from the active conversation while the wait continues.",
 			"yield_goal is terminal: make it the sole final tool action and do not call subagent_wait, ask_user_question, or another tool afterward.",
@@ -652,7 +652,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			type: "object",
 			properties: {
 				reason: { type: "string", description: "Bounded diagnostic reason for the external prerequisite." },
-				timeoutSeconds: { type: "integer", minimum: 30, maximum: 600, description: "Optional one-shot fallback timeout in seconds; defaults to 300." },
+				timeoutSeconds: { type: "integer", minimum: 30, maximum: 600, description: "Optional one-shot fallback timeout in seconds; defaults to 270." },
 				discardToken: { type: "string", description: "Optional token from the fallback timeout message being answered. Supply it only when this recheck produced nothing worth keeping; the recheck is then dropped from the active conversation and the wait continues." },
 			},
 			required: ["reason"],
@@ -764,6 +764,8 @@ export default function piGoal(pi: ExtensionAPI) {
 		clearYieldTimeout();
 		// A wake this extension did not schedule is a real external event, and that is what
 		// ends a wait sequence. A fallback wake continues the one already running.
+		// Pi persists the returned before_agent_start message before provider work, so this
+		// marker remains in the append-only transcript for later requests in the same run.
 		const fallbackWake = discardPermit?.goalId === goal.id;
 		if (!fallbackWake) clearDiscardState();
 		const resumed = resumeGoalState(fallbackWake ? goal : endWaitSequence(goal));
