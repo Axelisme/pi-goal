@@ -72,6 +72,41 @@ function flushMicrotasks() {
 	return new Promise((resolvePromise) => setImmediate(resolvePromise));
 }
 
+const stableGoalTools = ["host-tool", "create_goal", "get_goal", "update_goal", "yield_goal"];
+
+test("goal tools stay stable while lifecycle validity is enforced at execution", options, async () => {
+	const h = makeHarness();
+	h.pi.setActiveTools(["host-tool"]);
+	await install(h);
+
+	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "an empty goal still exposes the complete Tool Interface");
+	await assert.rejects(
+		h.tools.get("yield_goal").execute("yield", { reason: "invalid without a goal" }, null, null, h.ctx),
+		/yield_goal is only available for an active goal/,
+	);
+	const absentUpdate = await h.tools.get("update_goal").execute("update", { status: "complete" }, null, null, h.ctx);
+	assert.equal(absentUpdate.isError, true);
+	assert.match(absentUpdate.content[0].text, /No goal is set/);
+
+	await h.tools.get("create_goal").execute("create", { objective: "keep schemas stable" }, null, null, h.ctx);
+	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "creating a goal must not change Tool schemas");
+	await h.tools.get("yield_goal").execute("yield", { reason: "wait" }, null, null, h.ctx);
+	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "yielding must not change Tool schemas");
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "resuming must not change Tool schemas");
+
+	const completed = await h.tools.get("update_goal").execute("update", { status: "complete" }, null, null, h.ctx);
+	assert.notEqual(completed.isError, true);
+	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "completion must not change Tool schemas");
+	await assert.rejects(
+		h.tools.get("yield_goal").execute("yield", { reason: "invalid after completion" }, null, null, h.ctx),
+		/yield_goal is only available for an active goal/,
+	);
+	const completedAgain = await h.tools.get("update_goal").execute("update", { status: "complete" }, null, null, h.ctx);
+	assert.equal(completedAgain.isError, true);
+	assert.match(completedAgain.content[0].text, /must be active/);
+});
+
 test("persisted yielded v2 restore pauses safely with its objective and reason, without continuation", options, async () => {
 	const yielded = {
 		version: 2,
