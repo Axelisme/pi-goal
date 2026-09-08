@@ -23,7 +23,7 @@ export type GoalState = {
 	waitTimeouts?: number;
 };
 
-export type GoalEventKind = "active" | "continuation" | "yielded" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
+export type GoalEventKind = "active" | "continuation" | "yielded" | "timeout" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
 
 const VALID_STATUSES = new Set<GoalStatus>(["active", "yielded", "paused", "budget_limited", "complete"]);
 let waitSequenceCounter = 0;
@@ -171,6 +171,7 @@ export function goalEventStatus(kind: GoalEventKind): string {
 		active: "active",
 		continuation: "continuing",
 		yielded: "yielded",
+		timeout: "timed out",
 		paused: "paused",
 		resumed: "resumed",
 		cleared: "cleared",

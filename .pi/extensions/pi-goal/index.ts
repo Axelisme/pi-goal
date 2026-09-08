@@ -28,10 +28,23 @@ const EVENT_TYPE = "pi-goal-event";
 const OBSERVATION_TYPE = "pi-goal-observation";
 const OBSERVATION_VERSION = 1 as const;
 const CONTEXT_COMPACTION_THRESHOLD = 100_000;
+const DEFAULT_YIELD_TIMEOUT_MS = 29 * 60 * 1000;
+const MAX_YIELD_TIMEOUT_MS = 2_147_483_647;
+
+type YieldTimeoutSetting = {
+	milliseconds: number;
+	label: string;
+};
+
+type TimeoutCommandResult =
+	| { ok: true; command: "status" }
+	| { ok: true; command: "set"; setting: YieldTimeoutSetting }
+	| { ok: false; error: string };
 
 type WakeSource = "user" | "event" | "unknown";
 type WaitTerminationReason =
 	| "native_wake"
+	| "timeout"
 	| "resumed"
 	| "paused"
 	| "cleared"
@@ -50,8 +63,19 @@ type PendingYield = {
 	compactRequested: boolean;
 };
 
+type ArmedYieldTimeout = {
+	goalId: string;
+	yieldedAt: number | undefined;
+	waitId: string;
+	branchLeafId: string | null;
+	deadline: number;
+	handle: ReturnType<typeof setTimeout>;
+};
+
 let goal: GoalState | null = null;
 let statusBarEnabled = true;
+let yieldTimeoutSetting: YieldTimeoutSetting = { milliseconds: DEFAULT_YIELD_TIMEOUT_MS, label: "29m" };
+let armedYieldTimeout: ArmedYieldTimeout | null = null;
 let goalFooterInstalled = false;
 let activeTurnStartedAt: number | null = null;
 let activeGoalThisTurnId: string | null = null;
@@ -81,7 +105,27 @@ function clearPendingWakeSource() {
 
 function clearPendingWaitWork() {
 	pendingYield = null;
+	cancelYieldTimeout();
 	clearPendingWakeSource();
+}
+
+// T02 contract seed. The implementer owns parsing, status formatting, timer
+// validation, durable timeout transition, and lifecycle-safe cancellation.
+function parseTimeoutCommand(_input: string): TimeoutCommandResult {
+	return { ok: false, error: "Yield timeout command implementation is pending." };
+}
+
+function cancelYieldTimeout() {
+	// Contract seed: implementation must clear both the timer handle and operation authority.
+	armedYieldTimeout = null;
+}
+
+function armYieldTimeout(_pi: ExtensionAPI, _ctx: ExtensionContext, _state: GoalState) {
+	// Contract seed: called only after a successful durable yield.
+}
+
+function timeoutStatusText(): string {
+	return `Configured yield timeout: ${yieldTimeoutSetting.label}\nActive deadline: none`;
 }
 
 // A session boundary disowns an in-flight compaction request: its callbacks belong to a
@@ -112,6 +156,8 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 			return continuationPrompt(state);
 		case "yielded":
 			return `The active thread goal has yielded control until a real external event starts another agent turn. Do not continue autonomously and do not poll or set a timer.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nYield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
+		case "timeout":
+			return `The yielded goal reached its configured deadline and has been paused. Do not continue autonomously. Return control to the user and report that the prerequisite is still pending.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nYield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
 		case "budget_limited":
 			return budgetLimitPrompt(state);
 		case "paused":
@@ -232,7 +278,7 @@ function waitingDetails(state: GoalState | null) {
 	};
 }
 
-function latestStateFromSession(ctx: ExtensionContext): { goal: GoalState | null; statusBarEnabled: boolean; diagnostic?: string; migrated: boolean } {
+function latestStateFromSession(ctx: ExtensionContext): { goal: GoalState | null; statusBarEnabled: boolean; yieldTimeoutSetting: YieldTimeoutSetting; diagnostic?: string; migrated: boolean } {
 	const entries = ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i] as any;
@@ -243,10 +289,11 @@ function latestStateFromSession(ctx: ExtensionContext): { goal: GoalState | null
 				diagnostic: restored.diagnostic,
 				migrated: restored.migrated,
 				statusBarEnabled: entry.data?.statusBarEnabled ?? true,
+				yieldTimeoutSetting: { milliseconds: DEFAULT_YIELD_TIMEOUT_MS, label: "29m" },
 			};
 		}
 	}
-	return { goal: null, statusBarEnabled: true, migrated: false };
+	return { goal: null, statusBarEnabled: true, yieldTimeoutSetting: { milliseconds: DEFAULT_YIELD_TIMEOUT_MS, label: "29m" }, migrated: false };
 }
 
 function updateStatusBar(ctx: ExtensionContext) {
@@ -297,7 +344,7 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 	const previousContinuationQueued = continuationQueued;
 	const effectiveClass: PersistenceClass = classification === "acquire" && previous?.status === "active" && next?.status === "active" && previous.id !== next.id ? "retain" : classification;
 	try {
-		pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled });
+		pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled, yieldTimeoutMs: yieldTimeoutSetting.milliseconds, yieldTimeoutLabel: yieldTimeoutSetting.label });
 	} catch (error) {
 		if (effectiveClass === "acquire") {
 			// Acquiring authority is transactional: retain the prior safe state.
@@ -329,7 +376,7 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 }
 
 function persistSettings(pi: ExtensionAPI, ctx: ExtensionContext) {
-	pi.appendEntry(CUSTOM_TYPE, { goal, statusBarEnabled });
+	pi.appendEntry(CUSTOM_TYPE, { goal, statusBarEnabled, yieldTimeoutMs: yieldTimeoutSetting.milliseconds, yieldTimeoutLabel: yieldTimeoutSetting.label });
 	updateStatusBar(ctx);
 }
 
@@ -602,6 +649,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			const outcome = persist(pi, ctx, next, "revoke");
 			if (outcome.persisted) {
 				if (!previous || previous.waitId !== next.waitId) recordWaitStarted(pi, ctx, next);
+				armYieldTimeout(pi, ctx, next);
 				pendingYield = {
 					goalId: next.id,
 					yieldedAt: next.yieldedAt,
@@ -675,7 +723,7 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.registerCommand("goal", {
 		description: "Set, view, pause, resume, clear, or configure a long-running goal",
 		getArgumentCompletions: (prefix) => {
-			const values = ["pause", "resume", "clear", "status", "statusbar", "statusbar on", "statusbar off"];
+			const values = ["pause", "resume", "clear", "status", "statusbar", "statusbar on", "statusbar off", "timeout status", "timeout set "];
 			const filtered = values.filter((value) => value.startsWith(prefix));
 			return filtered.length ? filtered.map((value) => ({ value, label: value })) : null;
 		},
@@ -686,6 +734,22 @@ export default function piGoal(pi: ExtensionAPI) {
 			if (!trimmed || trimmed === "status") {
 				if (!goal) ctx.ui.notify("Usage: /goal [--tokens 50k] <objective>", "info");
 				else ctx.ui.notify(`${statusLine(goal)}\nObjective: ${goal.objective}${goal.status === "yielded" ? `\nWaiting for: ${goal.yieldReason}\nWait id: ${goal.waitId ?? "unknown"}` : ""}\nStatus bar: ${statusBarEnabled ? "on" : "off"}`, "info");
+				return;
+			}
+
+			if (trimmed === "timeout" || trimmed.startsWith("timeout ")) {
+				const parsed = parseTimeoutCommand(trimmed);
+				if (!parsed.ok) {
+					ctx.ui.notify(parsed.error, "warning");
+					return;
+				}
+				if (parsed.command === "status") {
+					ctx.ui.notify(timeoutStatusText(), "info");
+					return;
+				}
+				yieldTimeoutSetting = parsed.setting;
+				persistSettings(pi, ctx);
+				ctx.ui.notify(`Goal yield timeout set to ${parsed.setting.label}; it applies to the next yield.`, "info");
 				return;
 			}
 
@@ -758,6 +822,7 @@ export default function piGoal(pi: ExtensionAPI) {
 		const restored = latestStateFromSession(ctx);
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
+		yieldTimeoutSetting = restored.yieldTimeoutSetting;
 		continuationQueued = false;
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
@@ -871,6 +936,7 @@ export default function piGoal(pi: ExtensionAPI) {
 		const restored = latestStateFromSession(ctx);
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
+		yieldTimeoutSetting = restored.yieldTimeoutSetting;
 		if (restored.diagnostic) ctx.ui.notify(`Goal state ignored safely: ${restored.diagnostic}`, "warning");
 		if (goal?.status === "active" || goal?.status === "yielded") {
 			const previous = goal;
