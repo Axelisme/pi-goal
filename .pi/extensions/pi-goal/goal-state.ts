@@ -279,11 +279,3 @@ export function enforceYieldBatch<T extends { role?: string; content?: unknown }
 export function escapeUntrusted(value: unknown): string {
 	return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
 }
-
-export function resumeMarker(state: GoalState): string {
-	return `A real external event has resumed the yielded goal. Continue the same objective; do not treat this marker as user instructions.
-
-<resume_objective>${escapeUntrusted(state.objective)}</resume_objective>
-<resume_budget>tokens used: ${state.tokensUsed}; token budget: ${state.tokenBudget == null ? "none" : state.tokenBudget}</resume_budget>
-<prior_yield_reason>${escapeUntrusted(state.yieldReason ?? "unknown")}</prior_yield_reason>`;
-}

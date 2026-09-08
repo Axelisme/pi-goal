@@ -138,8 +138,8 @@ test("malformed and invalid yielded v2 records restore fail-safe without acquiri
 		assert.equal(lastGoal(h), invalid, "invalid durable witness is not replaced by an autonomous state");
 		assert.equal(h.sent.length, 0);
 		assert.equal(h.handlers.get("agent_end")({}, h.ctx), undefined);
-		const beforeStart = h.handlers.get("before_agent_start")({ prompt: "unrelated" }, h.ctx);
-		assert.equal(beforeStart, undefined);
+		h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+		assert.equal(lastGoal(h), invalid, "an unrelated turn cannot acquire authority from an invalid record");
 		assert.match(h.notices.at(-1), /Goal state ignored safely/);
 	}
 });
@@ -204,19 +204,16 @@ test("a later yielded run keeps its native custom wake entry across provider req
 
 	// Shipped Pi custom-message turns emit turn_start without before_agent_start. The native
 	// custom input that starts the run is already persistent, so it is the sole wake marker.
-	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
-	assert.equal(lastGoal(h).status, "active");
-	assert.equal(lastGoal(h).objective, "continue the audit");
-	assert.equal(lastGoal(h).yieldReason, "waiting for the test provider");
-
 	const { Agent } = await import(`${globalPi}/node_modules/@earendil-works/pi-agent-core/dist/index.js`);
 	const { createAssistantMessageEventStream } = await import(`${globalPi}/node_modules/@earendil-works/pi-ai/dist/index.js`);
 	const model = { id: "resume-contract", name: "resume-contract", api: "test", provider: "test", reasoning: false };
 	const providerContexts = [];
+	const providerGoalStatuses = [];
 	let providerCalls = 0;
 	const streamFn = (_model, context) => {
 		providerCalls += 1;
 		providerContexts.push(structuredClone(context.messages));
+		providerGoalStatuses.push(lastGoal(h).status);
 		const stream = createAssistantMessageEventStream();
 		const toolUse = providerCalls === 1;
 		const message = {
@@ -240,6 +237,9 @@ test("a later yielded run keeps its native custom wake entry across provider req
 		convertToLlm: (messages) => messages,
 		streamFn,
 	});
+	agent.subscribe((event) => {
+		if (event.type === "turn_start") h.handlers.get("turn_start")(event, h.ctx);
+	});
 	const persistentWake = {
 		role: "custom",
 		customType: "external-event",
@@ -249,6 +249,10 @@ test("a later yielded run keeps its native custom wake entry across provider req
 		timestamp: Date.now(),
 	};
 	await agent.prompt(persistentWake);
+	assert.equal(lastGoal(h).status, "active");
+	assert.equal(lastGoal(h).objective, "continue the audit");
+	assert.equal(lastGoal(h).yieldReason, "waiting for the test provider");
+	assert.deepEqual(providerGoalStatuses, ["active", "active"], "turn_start acquires authority before provider work");
 	assert.equal(providerCalls, 2, "the fake provider makes two requests in one agent run");
 	for (const messages of providerContexts) {
 		const wakes = messages.filter((message) => message.role === "custom" && message.customType === "external-event");

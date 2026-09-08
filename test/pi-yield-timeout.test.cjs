@@ -112,6 +112,13 @@ function makeHarness({ runtimeSupport = false, contextTokens, navigation = "real
 	return {
 		pi, ctx, commandCtx, handlers, tools, commands, entries, sent, notices, compactions, navigations,
 		leaf: () => leafId,
+		branchEntries: () => branch(),
+		async navigateSession(targetId) {
+			const oldLeafId = leafId;
+			await handlers.get("session_before_tree")?.({ type: "session_before_tree", preparation: {}, signal: new AbortController().signal }, ctx);
+			leafId = targetId;
+			await handlers.get("session_tree")?.({ type: "session_tree", oldLeafId, newLeafId: targetId }, ctx);
+		},
 		async flush() {
 			while (commandRuns.length) await commandRuns.shift();
 			await Promise.resolve();
@@ -582,6 +589,28 @@ test("a native turn before the deadline cancels the fallback wake-up", options, 
 	assert.equal(h.sent.length, 0);
 });
 
+test("tree navigation cancels the abandoned branch timeout and restores historical authority paused", options, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = makeHarness();
+	await install(h);
+	await startWait(h);
+	const historicalActive = h.entries.find((entry) => entry.data?.goal?.status === "active");
+	assert.ok(historicalActive);
+	const entriesBeforeNavigation = h.entries.length;
+	h.sent.length = 0;
+
+	await h.navigateSession(historicalActive.id);
+	const selectedBranch = h.branchEntries();
+	assert.equal(selectedBranch.at(-1).data.goal.status, "paused");
+	assert.equal(selectedBranch.at(-1).parentId, historicalActive.id);
+	assert.match(h.notices.at(-1), /Goal paused after tree navigation/);
+
+	t.mock.timers.tick(30_000);
+	assert.equal(h.sent.length, 0, "the abandoned branch timeout cannot wake the selected branch");
+	assert.equal(h.entries.length, entriesBeforeNavigation + 1, "only the selected branch pause is appended");
+	assert.equal(h.branchEntries().at(-1).data.goal.status, "paused");
+});
+
 test("pause and session shutdown cancel a pending fallback wake-up", options, async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const h = makeHarness();
@@ -680,9 +709,9 @@ test("yield_goal stays terminal, then its default timeout wakes the same yielded
 	assert.equal(h.sent[0].options.deliverAs, "followUp");
 	assert.equal(lastGoal(h).status, "yielded", "timeout delivery does not acquire authority");
 
-	const injected = await startAgent(h, "default yield timeout");
-	assert.equal(injected.message.details.resume, true);
+	await startAgent(h);
 	assert.equal(lastGoal(h).status, "active");
+	assert.equal(h.sent.filter((entry) => entry.message.details.kind === "resumed").length, 0, "the native timeout entry is the sole marker");
 	t.mock.timers.runAll();
 	assert.equal(h.sent.length, 1, "the timeout is one-shot");
 });
