@@ -69,7 +69,8 @@ type ArmedYieldTimeout = {
 	waitId: string;
 	branchLeafId: string | null;
 	deadline: number;
-	handle: ReturnType<typeof setTimeout>;
+	handle: ReturnType<typeof setTimeout> | null;
+	due: boolean;
 };
 
 let goal: GoalState | null = null;
@@ -109,23 +110,151 @@ function clearPendingWaitWork() {
 	clearPendingWakeSource();
 }
 
-// T02 contract seed. The implementer owns parsing, status formatting, timer
-// validation, durable timeout transition, and lifecycle-safe cancellation.
-function parseTimeoutCommand(_input: string): TimeoutCommandResult {
-	return { ok: false, error: "Yield timeout command implementation is pending." };
+const TIMEOUT_USAGE = "Usage: /goal timeout status | /goal timeout set <positive integer>s|m|h";
+
+type TimeoutDurationResult = { setting: YieldTimeoutSetting } | { error: string };
+
+function defaultYieldTimeoutSetting(): YieldTimeoutSetting {
+	return { milliseconds: DEFAULT_YIELD_TIMEOUT_MS, label: "29m" };
+}
+
+function parseTimeoutDuration(input: unknown): TimeoutDurationResult {
+	if (typeof input !== "string") return { error: "Timeout duration must be a positive integer followed by s, m, or h." };
+	const match = /^(\d+)([smh])$/i.exec(input);
+	if (!match) return { error: "Timeout duration must be a positive integer followed by s, m, or h." };
+	let amount: bigint;
+	try {
+		amount = BigInt(match[1]);
+	} catch {
+		return { error: "Timeout duration must be a positive integer followed by s, m, or h." };
+	}
+	if (amount <= 0n) return { error: "Timeout duration must be greater than zero." };
+	const unit = match[2].toLowerCase();
+	const multiplier = unit === "s" ? 1_000n : unit === "m" ? 60_000n : 3_600_000n;
+	const milliseconds = amount * multiplier;
+	if (milliseconds > BigInt(MAX_YIELD_TIMEOUT_MS)) {
+		return { error: `Timeout duration is too large; it must not exceed ${MAX_YIELD_TIMEOUT_MS} milliseconds.` };
+	}
+	const normalizedAmount = amount.toString();
+	return { setting: { milliseconds: Number(milliseconds), label: `${normalizedAmount}${unit}` } };
+}
+
+function parseTimeoutCommand(input: string): TimeoutCommandResult {
+	if (typeof input !== "string") return { ok: false, error: TIMEOUT_USAGE };
+	const parts = input.trim().split(/\s+/);
+	if (parts.length === 2 && parts[0] === "timeout" && parts[1] === "status") return { ok: true, command: "status" };
+	if (parts.length === 3 && parts[0] === "timeout" && parts[1] === "set") {
+		const parsed = parseTimeoutDuration(parts[2]);
+		return "error" in parsed ? { ok: false, error: parsed.error } : { ok: true, command: "set", setting: parsed.setting };
+	}
+	return { ok: false, error: TIMEOUT_USAGE };
+}
+
+function restoreYieldTimeoutSetting(data: unknown): YieldTimeoutSetting {
+	if (!data || typeof data !== "object") return defaultYieldTimeoutSetting();
+	const raw = data as Record<string, unknown>;
+	if (typeof raw.yieldTimeoutMs !== "number" || !Number.isSafeInteger(raw.yieldTimeoutMs) || raw.yieldTimeoutMs <= 0 || raw.yieldTimeoutMs > MAX_YIELD_TIMEOUT_MS) {
+		return defaultYieldTimeoutSetting();
+	}
+	if (typeof raw.yieldTimeoutLabel !== "string") return defaultYieldTimeoutSetting();
+	const parsed = parseTimeoutDuration(raw.yieldTimeoutLabel);
+	if ("error" in parsed || parsed.setting.milliseconds !== raw.yieldTimeoutMs) return defaultYieldTimeoutSetting();
+	return parsed.setting;
+}
+
+function currentBranchLeafId(ctx: ExtensionContext): string | null {
+	const sessionManager = (ctx as any).sessionManager;
+	try {
+		if (typeof sessionManager?.getLeafId === "function") {
+			const id = sessionManager.getLeafId();
+			if (typeof id === "string" && id) return id;
+		}
+	} catch {
+		// Fall through to the branch snapshot, which is also available in Pi's runtime.
+	}
+	try {
+		const branch = typeof sessionManager?.getBranch === "function" ? sessionManager.getBranch() : undefined;
+		const id = Array.isArray(branch) ? branch.at(-1)?.id : undefined;
+		return typeof id === "string" && id ? id : null;
+	} catch {
+		return null;
+	}
+}
+
+function branchContainsIdentity(ctx: ExtensionContext, identity: string | null): boolean {
+	if (identity === null) return currentBranchLeafId(ctx) === null;
+	const sessionManager = (ctx as any).sessionManager;
+	try {
+		const branch = typeof sessionManager?.getBranch === "function" ? sessionManager.getBranch() : undefined;
+		if (Array.isArray(branch)) return branch.some((entry) => entry?.id === identity);
+	} catch {
+		// The leaf check below is the narrowest safe fallback when a branch snapshot fails.
+	}
+	return currentBranchLeafId(ctx) === identity;
 }
 
 function cancelYieldTimeout() {
-	// Contract seed: implementation must clear both the timer handle and operation authority.
+	const operation = armedYieldTimeout;
 	armedYieldTimeout = null;
+	if (operation?.handle !== null && operation?.handle !== undefined) {
+		clearTimeout(operation.handle);
+		operation.handle = null;
+	}
 }
 
-function armYieldTimeout(_pi: ExtensionAPI, _ctx: ExtensionContext, _state: GoalState) {
-	// Contract seed: called only after a successful durable yield.
+function operationMatchesCurrent(ctx: ExtensionContext, operation: ArmedYieldTimeout): boolean {
+	return armedYieldTimeout === operation
+		&& !!goal
+		&& goal.status === "yielded"
+		&& goal.id === operation.goalId
+		&& goal.yieldedAt === operation.yieldedAt
+		&& goal.waitId === operation.waitId
+		&& branchContainsIdentity(ctx, operation.branchLeafId);
 }
 
-function timeoutStatusText(): string {
-	return `Configured yield timeout: ${yieldTimeoutSetting.label}\nActive deadline: none`;
+function armYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalState) {
+	cancelYieldTimeout();
+	if (state.status !== "yielded" || !state.waitId) return;
+	const deadline = Date.now() + yieldTimeoutSetting.milliseconds;
+	const operation: ArmedYieldTimeout = {
+		goalId: state.id,
+		yieldedAt: state.yieldedAt,
+		waitId: state.waitId,
+		branchLeafId: currentBranchLeafId(ctx),
+		deadline,
+		handle: null,
+		due: false,
+	};
+	try {
+		const handle = setTimeout(() => {
+			if (!operationMatchesCurrent(ctx, operation)) {
+				if (armedYieldTimeout === operation) armedYieldTimeout = null;
+				operation.handle = null;
+				return;
+			}
+			operation.handle = null;
+			operation.due = true;
+			if (!ctx.isIdle() || ctx.hasPendingMessages() || compactionActive || pendingYield?.compactRequested) return;
+			deliverYieldTimeout(pi, ctx, operation);
+		}, yieldTimeoutSetting.milliseconds);
+		operation.handle = handle;
+		// A watchdog must not keep an otherwise idle Pi process alive by itself.
+		(handle as any).unref?.();
+		armedYieldTimeout = operation;
+	} catch (error) {
+		ctx.ui.notify(`Goal timeout could not be armed: ${String(error)}`, "warning");
+	}
+}
+
+function timeoutStatusText(ctx: ExtensionContext): string {
+	const operation = armedYieldTimeout;
+	if (!operation) return `Configured yield timeout: ${yieldTimeoutSetting.label}\nActive deadline: none`;
+	if (!operationMatchesCurrent(ctx, operation)) {
+		cancelYieldTimeout();
+		return `Configured yield timeout: ${yieldTimeoutSetting.label}\nActive deadline: none`;
+	}
+	const remaining = Math.max(0, Math.ceil((operation.deadline - Date.now()) / 1000));
+	return `Configured yield timeout: ${yieldTimeoutSetting.label}\nActive deadline: ${new Date(operation.deadline).toISOString()}\nRemaining: ${remaining}s`;
 }
 
 // A session boundary disowns an in-flight compaction request: its callbacks belong to a
@@ -289,11 +418,11 @@ function latestStateFromSession(ctx: ExtensionContext): { goal: GoalState | null
 				diagnostic: restored.diagnostic,
 				migrated: restored.migrated,
 				statusBarEnabled: entry.data?.statusBarEnabled ?? true,
-				yieldTimeoutSetting: { milliseconds: DEFAULT_YIELD_TIMEOUT_MS, label: "29m" },
+				yieldTimeoutSetting: restoreYieldTimeoutSetting(entry.data),
 			};
 		}
 	}
-	return { goal: null, statusBarEnabled: true, yieldTimeoutSetting: { milliseconds: DEFAULT_YIELD_TIMEOUT_MS, label: "29m" }, migrated: false };
+	return { goal: null, statusBarEnabled: true, yieldTimeoutSetting: defaultYieldTimeoutSetting(), migrated: false };
 }
 
 function updateStatusBar(ctx: ExtensionContext) {
@@ -356,7 +485,10 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 			goal = effectiveClass === "retain" ? retainedFallback(next) : next;
 			continuationQueued = false;
 		}
-		if (goal?.status !== "yielded") pendingYield = null;
+		if (goal?.status !== "yielded" || next?.status === "yielded") {
+			pendingYield = null;
+			cancelYieldTimeout();
+		}
 		updateStatusBar(ctx);
 		return {
 			persisted: false,
@@ -370,14 +502,55 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 	if (next?.status !== "active") {
 		continuationQueued = false;
 	}
-	if (next?.status !== "yielded") pendingYield = null;
+	if (next?.status !== "yielded") {
+		pendingYield = null;
+		cancelYieldTimeout();
+	}
 	updateStatusBar(ctx);
 	return { persisted: true, goal: next, classification: effectiveClass, mode: "committed" };
 }
 
 function persistSettings(pi: ExtensionAPI, ctx: ExtensionContext) {
+	const operation = armedYieldTimeout;
 	pi.appendEntry(CUSTOM_TYPE, { goal, statusBarEnabled, yieldTimeoutMs: yieldTimeoutSetting.milliseconds, yieldTimeoutLabel: yieldTimeoutSetting.label });
 	updateStatusBar(ctx);
+	// Settings are ordinary same-branch entries. Refresh the anchor when a
+	// host exposes only its leaf id; hosts with getBranch retain the ancestor.
+	if (operation && armedYieldTimeout === operation) operation.branchLeafId = currentBranchLeafId(ctx);
+}
+
+function deliverYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, operation: ArmedYieldTimeout) {
+	if (!operationMatchesCurrent(ctx, operation)) {
+		if (armedYieldTimeout === operation) armedYieldTimeout = null;
+		operation.handle = null;
+		return;
+	}
+	// The operation is consumed before any persistence or publication. Neither a
+	// failure nor a later lifecycle callback may re-arm this one-shot wake.
+	armedYieldTimeout = null;
+	operation.handle = null;
+	const previous = goal;
+	if (!previous) return;
+	const paused: GoalState = { ...endWaitSequence(previous), status: "paused", updatedAt: Date.now() };
+	const outcome = persist(pi, ctx, paused, "revoke");
+	if (reportPersistenceFailure(ctx, "Goal timeout pause revoked autonomy in memory but is nondurable", outcome)) return;
+	recordWaitEndAfterPersist(pi, ctx, previous, outcome, "timeout");
+	try {
+		emitGoalEvent(pi, "timeout", paused, { triggerTurn: true, deliverAs: "followUp" });
+	} catch (error) {
+		ctx.ui.notify(`Goal timeout follow-up could not be published: ${String(error)}`, "warning");
+	}
+}
+
+function maybeDeliverDueYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext) {
+	const operation = armedYieldTimeout;
+	if (!operation?.due) return;
+	if (!operationMatchesCurrent(ctx, operation)) {
+		if (armedYieldTimeout === operation) armedYieldTimeout = null;
+		return;
+	}
+	if (!ctx.isIdle() || ctx.hasPendingMessages() || compactionActive || pendingYield?.compactRequested) return;
+	deliverYieldTimeout(pi, ctx, operation);
 }
 
 function reportPersistenceFailure(ctx: ExtensionContext, operation: string, outcome: PersistenceOutcome): boolean {
@@ -408,19 +581,29 @@ function settlePendingYield(pi: ExtensionAPI, ctx: ExtensionContext, pending: Pe
 	}
 	if (!ctx.isIdle() || compactionActive) return;
 	pendingYield = null;
-	runPendingCompaction(pi, ctx, pending);
+	runPendingCompaction(pi, ctx, pending, () => maybeDeliverDueYieldTimeout(pi, ctx));
 }
 
-function runPendingCompaction(_pi: ExtensionAPI, ctx: ExtensionContext, pending: PendingYield) {
-	if (!pending.compactRequested) return;
+function runPendingCompaction(_pi: ExtensionAPI, ctx: ExtensionContext, pending: PendingYield, onSettled?: () => void) {
+	if (!pending.compactRequested) {
+		onSettled?.();
+		return;
+	}
 	const compact = (ctx as any).compact;
-	if (typeof compact !== "function") return;
+	if (typeof compact !== "function") {
+		onSettled?.();
+		return;
+	}
 	// Recheck the threshold at settlement; the yield itself only records that a compaction may be needed.
 	const tokens = readContextTokens(ctx);
-	if (tokens == null || tokens <= CONTEXT_COMPACTION_THRESHOLD) return;
+	if (tokens == null || tokens <= CONTEXT_COMPACTION_THRESHOLD) {
+		onSettled?.();
+		return;
+	}
 	compactionActive = true;
 	const finish = () => {
 		compactionActive = false;
+		onSettled?.();
 	};
 	try {
 		compact.call(ctx, {
@@ -437,6 +620,7 @@ function runPendingCompaction(_pi: ExtensionAPI, ctx: ExtensionContext, pending:
 	} catch (error) {
 		compactionActive = false;
 		ctx.ui.notify(`Goal yield compaction failed: ${String(error)}`, "warning");
+		onSettled?.();
 	}
 }
 
@@ -728,7 +912,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			return filtered.length ? filtered.map((value) => ({ value, label: value })) : null;
 		},
 		handler: async (args, ctx) => {
-			const trimmed = args.trim();
+			const trimmed = typeof args === "string" ? args.trim() : "";
 			const now = Date.now();
 
 			if (!trimmed || trimmed === "status") {
@@ -744,11 +928,18 @@ export default function piGoal(pi: ExtensionAPI) {
 					return;
 				}
 				if (parsed.command === "status") {
-					ctx.ui.notify(timeoutStatusText(), "info");
+					ctx.ui.notify(timeoutStatusText(ctx), "info");
 					return;
 				}
+				const previousSetting = yieldTimeoutSetting;
 				yieldTimeoutSetting = parsed.setting;
-				persistSettings(pi, ctx);
+				try {
+					persistSettings(pi, ctx);
+				} catch (error) {
+					yieldTimeoutSetting = previousSetting;
+					ctx.ui.notify(`Goal timeout setting was not persisted: ${String(error)}`, "warning");
+					return;
+				}
 				ctx.ui.notify(`Goal yield timeout set to ${parsed.setting.label}; it applies to the next yield.`, "info");
 				return;
 			}
@@ -959,6 +1150,8 @@ export default function piGoal(pi: ExtensionAPI) {
 		if (goal?.status === "yielded") {
 			// Only one candidate confirmed by before_agent_start can carry its source
 			// into this turn. Any overlap or unresolved candidate stays unknown.
+			// A real turn wins over a due-but-not-delivered watchdog operation.
+			cancelYieldTimeout();
 			const previous = goal;
 			const wakeSource = pendingInputWakeAmbiguous ? "unknown" : pendingWakeSource ?? "unknown";
 			clearPendingWakeSource();
@@ -998,8 +1191,16 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", (event, ctx) => {
-		if (!goal || goal.status !== "active") return;
+		if (!goal) return;
 		if (agentRunWasAborted(event.messages)) {
+			if (goal.status === "yielded") {
+				// An interrupted terminal handoff must not leave its process-local
+				// watchdog alive. The durable yielded state remains available for a
+				// later native wake, but this interrupted operation is disowned.
+				clearPendingWaitWork();
+				return;
+			}
+			if (goal.status !== "active") return;
 			const previous = goal;
 			const paused = { ...endWaitSequence(goal), status: "paused" as const, updatedAt: Date.now() };
 			const outcome = persist(pi, ctx, paused, "revoke");
@@ -1020,6 +1221,7 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.on("agent_settled", (_event, ctx) => {
 		const pending = pendingYield;
 		if (pending) settlePendingYield(pi, ctx, pending);
+		else maybeDeliverDueYieldTimeout(pi, ctx);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
