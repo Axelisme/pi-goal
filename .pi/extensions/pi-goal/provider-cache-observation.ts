@@ -27,6 +27,7 @@ type ProviderCacheObservation = {
 	usage: {
 		input: number;
 		cacheRead: number;
+		/** Current OpenAI Responses transports report 0 when this value is unavailable; 0 does not prove that no cache write occurred. */
 		cacheWrite: number;
 	};
 	segments: {

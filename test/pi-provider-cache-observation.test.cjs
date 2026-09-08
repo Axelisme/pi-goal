@@ -214,19 +214,37 @@ test("session start drops unmatched request state before later assistant usage",
 	}
 });
 
-test("serialization and durability failures never alter provider or assistant behavior", options, async () => {
+test("segment serialization failure leaves the provider request unchanged", options, async () => {
 	const h = await install();
 	const circular = {};
 	circular.instructions = circular;
 	const beforeResults = await h.emit("before_provider_request", { type: "before_provider_request", payload: circular });
 	assert.deepEqual(beforeResults, [undefined]);
+	assert.equal(observations(h).length, 0);
+	assert.equal(h.notices.some((notice) => notice.includes("payload segment")), true);
+});
 
-	h.setAppendThrows(true);
+test("malformed usage leaves the assistant message unchanged and records no observation", options, async () => {
+	const h = await install();
+	await h.emit("before_provider_request", { type: "before_provider_request", payload: firstPayload });
 	const message = assistant({ input: Number.NaN, cacheRead: -1, cacheWrite: undefined });
 	const original = structuredClone(message);
 	const messageResults = await h.emit("message_end", { type: "message_end", message });
 	assert.deepEqual(message, original);
 	assert.equal(messageResults.every((result) => result === undefined), true);
 	assert.equal(observations(h).length, 0);
-	assert.equal(h.notices.some((notice) => notice.includes("observation")), true);
+	assert.equal(h.notices.some((notice) => notice.includes("usage was unavailable or invalid")), true);
+});
+
+test("durability failure leaves the assistant message unchanged and does not escape", options, async () => {
+	const h = await install();
+	await h.emit("before_provider_request", { type: "before_provider_request", payload: firstPayload });
+	h.setAppendThrows(true);
+	const message = assistant();
+	const original = structuredClone(message);
+	const messageResults = await h.emit("message_end", { type: "message_end", message });
+	assert.deepEqual(message, original);
+	assert.equal(messageResults.every((result) => result === undefined), true);
+	assert.equal(observations(h).length, 0);
+	assert.equal(h.notices.some((notice) => notice.includes("not durable")), true);
 });
