@@ -78,24 +78,21 @@ function flushMicrotasks() {
 const goalTools = ["create_goal", "get_goal", "update_goal", "yield_goal"];
 const stableGoalTools = ["host-tool", ...goalTools];
 
-test("yield_goal exposes explicit wake intent and returns a quiet waiting contract", options, async () => {
+test("yield_goal accepts only a reason and returns a quiet waiting contract", options, async () => {
 	const h = makeHarness();
 	await install(h);
 	const tool = h.tools.get("yield_goal");
-	assert.deepEqual(tool.parameters.required, ["reason", "expect_wake_by"]);
-	assert.deepEqual(tool.parameters.properties.expect_wake_by.enum, ["user", "event"]);
-	assert.equal(tool.parameters.properties.timeoutSeconds, undefined);
+	assert.deepEqual(tool.parameters.required, ["reason"]);
+	assert.deepEqual(Object.keys(tool.parameters.properties), ["reason"]);
 
 	await h.tools.get("create_goal").execute("create", { objective: "wait for approval" }, null, null, h.ctx);
 	h.sent.length = 0;
-	const result = await tool.execute("yield", { reason: "release owner approval", expect_wake_by: "user" }, null, null, h.ctx);
+	const result = await tool.execute("yield", { reason: "release owner approval" }, null, null, h.ctx);
 	const payload = JSON.parse(result.content[0].text);
 	assert.equal(result.terminate, true);
-	assert.equal(payload.goal.expectWakeBy, "user");
+	assert.equal(Object.hasOwn(payload, "discard"), false);
+	assert.equal(Object.hasOwn(result.details, "discard"), false);
 	assert.equal(payload.waiting.id, payload.goal.waitId);
-	assert.equal(payload.waiting.heartbeat, "waiting_without_heartbeat");
-	assert.equal(payload.waiting.nextHeartbeatAt, null);
-	assert.equal(payload.waiting.reasonCode, "user_away_prior");
 	assert.equal(h.sent.length, 0);
 });
 

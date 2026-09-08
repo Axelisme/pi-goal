@@ -592,23 +592,19 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "yield_goal",
 		label: "Yield Goal",
-		description: "Terminally yield the active goal until a real future agent turn arrives. State whether the expected wake is a user or event; the runtime may continue waiting without a paid heartbeat.",
-		promptSnippet: "Return control while the goal is blocked on a future user or event wake",
+		description: "Terminally yield the active goal until a real future agent turn arrives.",
+		promptSnippet: "Return control while the goal is blocked on a future turn",
 		promptGuidelines: [
 			"Call yield_goal only when no blocking tool is awaiting an in-run answer, no synchronous autonomous work remains, and a concrete future event can start another turn.",
-			"Provide a concise reason naming the external prerequisite and classify the expected wake as user or event. This expectation never filters other legitimate notifications.",
-			"The approved cache window is 270 seconds, but this conservative tracer does not buy a heartbeat. Do not request another interval or assume a timer will wake the goal.",
-			"Pass discardToken only when answering a runtime-issued recheck. This tracer issues no recheck token, so arbitrary token text never grants rewind authority.",
+			"Provide a concise reason naming the external prerequisite.",
 			"yield_goal is terminal: make it the sole final tool action and do not call subagent_wait, ask_user_question, or another tool afterward.",
 		],
 		parameters: {
 			type: "object",
 			properties: {
 				reason: { type: "string", description: "Bounded diagnostic reason for the external prerequisite." },
-				expect_wake_by: { type: "string", enum: ["user", "event"], description: "Expected wake source. This is a policy hint, not a notification filter." },
-				discardToken: { type: "string", description: "Optional token from a runtime-issued recheck. Token text alone grants no rewind authority." },
 			},
-			required: ["reason", "expect_wake_by"],
+			required: ["reason"],
 			additionalProperties: false,
 		} as any,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -616,7 +612,7 @@ export default function piGoal(pi: ExtensionAPI) {
 				throw new Error("yield_goal is only available for an active goal.");
 			}
 			const input = params && typeof params === "object" ? params as Record<string, unknown> : {};
-			const allowed = new Set(["reason", "expect_wake_by", "discardToken", "timeoutSeconds"]);
+			const allowed = new Set(["reason"]);
 			for (const key of Object.keys(input)) {
 				if (!allowed.has(key)) throw new Error(`Unsupported yield_goal parameter: ${key}`);
 			}
@@ -624,18 +620,8 @@ export default function piGoal(pi: ExtensionAPI) {
 			if (!normalized) {
 				throw new Error("reason is required and must be a non-empty string.");
 			}
-			if (Object.prototype.hasOwnProperty.call(input, "timeoutSeconds")) {
-				throw new Error("timeoutSeconds is no longer supported; the cache window is fixed at 270 seconds.");
-			}
-			const expectWakeBy = normalizeExpectedWakeBy(input.expect_wake_by);
-			if (!expectWakeBy) {
-				throw new Error('expect_wake_by is required and must be either "user" or "event".');
-			}
-			const hasDiscardToken = Object.prototype.hasOwnProperty.call(input, "discardToken");
-			const requestedToken = hasDiscardToken && typeof input.discardToken === "string" ? input.discardToken.trim() : "";
-			if (hasDiscardToken && (!requestedToken || typeof input.discardToken !== "string")) {
-				throw new Error("discardToken must be a non-empty string when provided.");
-			}
+			// Contract seed: the remainder removes this internal compatibility choice with wait-policy.
+			const expectWakeBy = normalizeExpectedWakeBy("event")!;
 			const waitDecision = decideWait(expectWakeBy);
 			const next = yieldGoalState(goal, normalized, expectWakeBy, waitDecision.reason);
 			if (!next) {
@@ -655,17 +641,12 @@ export default function piGoal(pi: ExtensionAPI) {
 					compactRequested: contextTokens != null && contextTokens > CONTEXT_COMPACTION_THRESHOLD,
 				};
 			}
-			const discardResult = {
-				requested: requestedToken !== "",
-				accepted: false,
-				reason: requestedToken ? "no fallback timeout wake is open for this goal" : null,
-			};
 			// Do not publish a custom marker here: sendMessage() while streaming would turn
 			// this terminal action into a wake-up. The result and status are the handoff.
 			const waiting = outcome.persisted ? waitingDetails(next) : null;
 			return {
-				content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, terminal: true, terminalAction: "yield", waiting, persisted: outcome.persisted, discard: discardResult, diagnostic: outcome.diagnostic ?? null }, null, 2) }],
-				details: { goal: outcome.goal, terminal: true, terminalAction: "yield", waiting, persisted: outcome.persisted, discard: discardResult, diagnostic: outcome.diagnostic },
+				content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, terminal: true, terminalAction: "yield", waiting, persisted: outcome.persisted, diagnostic: outcome.diagnostic ?? null }, null, 2) }],
+				details: { goal: outcome.goal, terminal: true, terminalAction: "yield", waiting, persisted: outcome.persisted, diagnostic: outcome.diagnostic },
 				terminate: true,
 			} as any;
 		},
