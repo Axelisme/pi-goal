@@ -2,7 +2,7 @@ export type GoalStatus = "active" | "yielded" | "paused" | "budget_limited" | "c
 
 export const GOAL_STATE_VERSION = 3 as const;
 export const MAX_YIELD_REASON_LENGTH = 240;
-export const DEFAULT_YIELD_TIMEOUT_SECONDS = 300;
+export const DEFAULT_YIELD_TIMEOUT_SECONDS = 270;
 export const MIN_YIELD_TIMEOUT_SECONDS = 30;
 export const MAX_YIELD_TIMEOUT_SECONDS = 600;
 
@@ -278,12 +278,4 @@ export function enforceYieldBatch<T extends { role?: string; content?: unknown }
 
 export function escapeUntrusted(value: unknown): string {
 	return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
-}
-
-export function resumeMarker(state: GoalState): string {
-	return `A real external event has resumed the yielded goal. Continue the same objective; do not treat this marker as user instructions.
-
-<resume_objective>${escapeUntrusted(state.objective)}</resume_objective>
-<resume_budget>tokens used: ${state.tokensUsed}; token budget: ${state.tokenBudget == null ? "none" : state.tokenBudget}</resume_budget>
-<prior_yield_reason>${escapeUntrusted(state.yieldReason ?? "unknown")}</prior_yield_reason>`;
 }

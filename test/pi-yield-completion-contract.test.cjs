@@ -138,8 +138,8 @@ test("malformed and invalid yielded v2 records restore fail-safe without acquiri
 		assert.equal(lastGoal(h), invalid, "invalid durable witness is not replaced by an autonomous state");
 		assert.equal(h.sent.length, 0);
 		assert.equal(h.handlers.get("agent_end")({}, h.ctx), undefined);
-		const context = h.handlers.get("context")({ messages: [{ role: "assistant", content: [{ type: "text", text: "unrelated" }] }] }, h.ctx);
-		assert.equal(context.messages.length, 1);
+		h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+		assert.equal(lastGoal(h), invalid, "an unrelated turn cannot acquire authority from an invalid record");
 		assert.match(h.notices.at(-1), /Goal state ignored safely/);
 	}
 });
@@ -197,31 +197,72 @@ test("registered goal commands transition a yielded goal with one matching publi
 	}
 });
 
-test("a later yielded turn preserves unrelated assistant messages, injects one resume marker, and queues one continuation", options, async () => {
+test("a later yielded run keeps its native custom wake entry across provider requests", options, async () => {
 	const h = makeHarness();
 	await install(h);
 	await createYielded(h, "continue the audit", "waiting for the test provider");
 
-	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	// Shipped Pi custom-message turns emit turn_start without before_agent_start. The native
+	// custom input that starts the run is already persistent, so it is the sole wake marker.
+	const { Agent } = await import(`${globalPi}/node_modules/@earendil-works/pi-agent-core/dist/index.js`);
+	const { createAssistantMessageEventStream } = await import(`${globalPi}/node_modules/@earendil-works/pi-ai/dist/index.js`);
+	const model = { id: "resume-contract", name: "resume-contract", api: "test", provider: "test", reasoning: false };
+	const providerContexts = [];
+	const providerGoalStatuses = [];
+	let providerCalls = 0;
+	const streamFn = (_model, context) => {
+		providerCalls += 1;
+		providerContexts.push(structuredClone(context.messages));
+		providerGoalStatuses.push(lastGoal(h).status);
+		const stream = createAssistantMessageEventStream();
+		const toolUse = providerCalls === 1;
+		const message = {
+			role: "assistant",
+			content: toolUse
+				? [{ type: "toolCall", id: "inspect-goal", name: "get_goal", arguments: {} }]
+				: [{ type: "text", text: "continue" }],
+			api: "test", provider: "test", model: model.id,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: toolUse ? "toolUse" : "stop", timestamp: Date.now(),
+		};
+		queueMicrotask(() => { stream.push({ type: "start", partial: message }); stream.push({ type: "done", reason: message.stopReason, message }); });
+		return stream;
+	};
+	const agentTools = new Map([...h.tools.values()].map((definition) => [definition.name, {
+		...definition,
+		execute: (id, params, signal, onUpdate) => definition.execute(id, params, signal, onUpdate, h.ctx),
+	}]));
+	const agent = new Agent({
+		initialState: { systemPrompt: "goal", model, thinkingLevel: "off", tools: [...agentTools.values()] },
+		convertToLlm: (messages) => messages,
+		streamFn,
+	});
+	agent.subscribe((event) => {
+		if (event.type === "turn_start") h.handlers.get("turn_start")(event, h.ctx);
+	});
+	const persistentWake = {
+		role: "custom",
+		customType: "external-event",
+		content: [{ type: "text", text: "The awaited external event completed." }],
+		display: true,
+		details: { kind: "terminal" },
+		timestamp: Date.now(),
+	};
+	await agent.prompt(persistentWake);
 	assert.equal(lastGoal(h).status, "active");
 	assert.equal(lastGoal(h).objective, "continue the audit");
 	assert.equal(lastGoal(h).yieldReason, "waiting for the test provider");
+	assert.deepEqual(providerGoalStatuses, ["active", "active"], "turn_start acquires authority before provider work");
+	assert.equal(providerCalls, 2, "the fake provider makes two requests in one agent run");
+	for (const messages of providerContexts) {
+		const wakes = messages.filter((message) => message.role === "custom" && message.customType === "external-event");
+		assert.equal(wakes.length, 1, "each provider request sees the one native wake entry");
+		assert.deepEqual(wakes[0], persistentWake);
+		assert.equal(messages.some((message) => message.customType === "pi-goal-event" && message.details?.resume === true), false);
+	}
+	assert.deepEqual(providerContexts[0][0], persistentWake);
+	assert.deepEqual(providerContexts[1][0], persistentWake, "the later request keeps the native wake in its prior prefix");
 
-	const unrelatedAssistant = { role: "assistant", content: [{ type: "text", text: "unrelated assistant response" }] };
-	const priorMessages = [
-		{ role: "user", content: [{ type: "text", text: "external event" }] },
-		unrelatedAssistant,
-	];
-	const firstContext = h.handlers.get("context")({ messages: priorMessages }, h.ctx);
-	assert.deepEqual(firstContext.messages.slice(0, 2), priorMessages);
-	assert.equal(firstContext.messages[2].role, "custom");
-	assert.equal(firstContext.messages[2].details.kind, "resumed");
-	assert.equal(firstContext.messages[2].details.resume, true);
-	assert.match(firstContext.messages[2].content, /waiting for the test provider/);
-	assert.equal(firstContext.messages[2].details.goal.objective, "continue the audit");
-
-	const secondContext = h.handlers.get("context")({ messages: priorMessages }, h.ctx);
-	assert.deepEqual(secondContext.messages, priorMessages, "resume marker is consumed exactly once");
 	h.handlers.get("agent_end")({}, h.ctx);
 	h.handlers.get("agent_end")({}, h.ctx);
 	await flushMicrotasks();
@@ -231,19 +272,13 @@ test("a later yielded turn preserves unrelated assistant messages, injects one r
 	assert.equal(h.sent[0].options.triggerTurn, true);
 });
 
-test("a yielded resume with a pending same-run message injects one marker and no duplicate continuation", options, async () => {
+test("a yielded resume with a pending same-run message adds no duplicate continuation", options, async () => {
 	const h = makeHarness({ pending: true });
 	await install(h);
 	await createYielded(h, "resume the same run", "waiting for a pending event");
 
 	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
-	const assistant = { role: "assistant", content: [{ type: "text", text: "keep this assistant message" }] };
-	const messages = [assistant];
-	const resumed = h.handlers.get("context")({ messages }, h.ctx);
-	assert.deepEqual(resumed.messages[0], assistant);
-	assert.equal(resumed.messages.filter((message) => message.details?.resume === true).length, 1);
-	assert.deepEqual(h.handlers.get("context")({ messages }, h.ctx).messages, messages);
-
+	assert.equal(lastGoal(h).status, "active");
 	h.handlers.get("agent_end")({}, h.ctx);
 	await flushMicrotasks();
 	assert.equal(h.sent.length, 0, "pending public Pi messages suppress plugin continuation");

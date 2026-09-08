@@ -14,7 +14,6 @@ import {
 	normalizeTokenBudget,
 	normalizeYieldTimeoutSeconds,
 	enforceYieldBatch,
-	resumeMarker,
 	restoreGoalState,
 	resumeGoalState,
 	yieldGoalState,
@@ -50,8 +49,11 @@ type YieldTimeoutOperation = {
 	goalId: string;
 	yieldedAt: number | undefined;
 	wakeTimeoutSeconds: number;
+	armedEntryId: string | null;
 };
 let yieldTimeoutOperation: YieldTimeoutOperation | null = null;
+let yieldTimeoutArmedEntryId: string | null = null;
+let internalTreeNavigation = false;
 
 // The branch position a discard rewinds to: the leaf captured once a yield cycle, and any
 // compaction it asked for, has finished. Everything below is process-local by design — a
@@ -76,9 +78,6 @@ type PendingYield = {
 let pendingYield: PendingYield | null = null;
 let compactionActive = false;
 let mintCounter = 0;
-// Set only for the first provider context after a yielded goal is reactivated.
-// This is transient and intentionally never persisted.
-let resumeMarkerPending = false;
 
 function mint(prefix: string): string {
 	mintCounter += 1;
@@ -261,7 +260,6 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 			// defensible accounting/objective data but pauses autonomous authority.
 			goal = effectiveClass === "retain" ? retainedFallback(next) : next;
 			continuationQueued = false;
-			resumeMarkerPending = false;
 		}
 		if (goal?.status !== "yielded") clearYieldTimeout();
 		syncDiscardState(previous, goal);
@@ -302,12 +300,17 @@ function clearYieldTimeout() {
 	if (yieldTimeoutHandle !== null) clearTimeout(yieldTimeoutHandle);
 	yieldTimeoutHandle = null;
 	yieldTimeoutOperation = null;
+	yieldTimeoutArmedEntryId = null;
 }
 
 function currentYieldTimeoutGoal(ctx: ExtensionContext, operation: YieldTimeoutOperation): GoalState | null {
+	const branch = ctx.sessionManager.getBranch?.();
+	const armedEntryIsCurrent = operation.armedEntryId == null
+		|| (Array.isArray(branch) && branch.some((entry: any) => entry.id === operation.armedEntryId));
 	if (
 		yieldTimeoutOperation !== operation
 		|| yieldTimeoutEpoch !== operation.epoch
+		|| !armedEntryIsCurrent
 		|| !goal
 		|| goal.id !== operation.goalId
 		|| goal.status !== "yielded"
@@ -353,11 +356,12 @@ function armYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalSta
 	const epoch = yieldTimeoutEpoch;
 	const goalId = state.id;
 	const yieldedAt = state.yieldedAt;
+	yieldTimeoutArmedEntryId = ctx.sessionManager.getLeafId?.() ?? null;
 	const timeoutAt = Date.now() + timeoutSeconds * 1000;
 	yieldTimeoutHandle = setTimeout(() => {
 		if (yieldTimeoutEpoch !== epoch) return;
 		yieldTimeoutHandle = null;
-		const operation: YieldTimeoutOperation = { epoch, goalId, yieldedAt, wakeTimeoutSeconds: timeoutSeconds };
+		const operation: YieldTimeoutOperation = { epoch, goalId, yieldedAt, wakeTimeoutSeconds: timeoutSeconds, armedEntryId: yieldTimeoutArmedEntryId };
 		yieldTimeoutOperation = operation;
 		runYieldTimeoutOperation(pi, ctx, operation);
 	}, timeoutSeconds * 1000);
@@ -423,6 +427,7 @@ async function runRewindCommand(pi: ExtensionAPI, ctx: ExtensionContext, nonce: 
 	if (typeof navigate !== "function") {
 		ctx.ui.notify("Goal discard kept the recheck: this runtime cannot navigate the session tree.", "warning");
 	} else {
+		internalTreeNavigation = true;
 		try {
 			const result = await navigate.call(ctx, target);
 			// A host that binds a no-op navigateTree reports success without moving the leaf,
@@ -430,6 +435,8 @@ async function runRewindCommand(pi: ExtensionAPI, ctx: ExtensionContext, nonce: 
 			landed = !result?.cancelled && ctx.sessionManager.getLeafId?.() === target;
 		} catch (error) {
 			ctx.ui.notify(`Goal discard could not rewind: ${String(error)}`, "warning");
+		} finally {
+			internalTreeNavigation = false;
 		}
 		if (!landed) ctx.ui.notify("Goal discard kept the recheck: the session did not rewind to the yield point.", "warning");
 	}
@@ -438,6 +445,7 @@ async function runRewindCommand(pi: ExtensionAPI, ctx: ExtensionContext, nonce: 
 		// yield left the active branch with it, and its wait counters went too.
 		const outcome = persist(pi, ctx, goal, "retain");
 		reportPersistenceFailure(ctx, "Goal discard rewound but its state is nondurable", outcome);
+		if (outcome.persisted) yieldTimeoutArmedEntryId = ctx.sessionManager.getLeafId?.() ?? null;
 	}
 	captureRewindPoint(ctx);
 	runPendingCompaction(pi, ctx, pending);
@@ -647,7 +655,7 @@ export default function piGoal(pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Call yield_goal only when no blocking tool is awaiting an in-run answer, no synchronous autonomous work remains, and a concrete future event can start another turn.",
 			"Provide a concise reason naming the external prerequisite (for example child completion, provider result, authorization, or a future user reply).",
-			"yield_goal uses a five-minute fallback timeout by default; timeout expiry only requests a recheck and is not evidence that the prerequisite completed.",
+			"yield_goal uses a 270-second fallback timeout by default to recheck before a five-minute cache-heartbeat boundary; timeout expiry only requests a recheck and is not evidence that the prerequisite completed.",
 			"Set yield_goal timeoutSeconds only when the expected external event needs a different bounded recheck window between 30 and 600 seconds.",
 			"Pass discardToken only with the token from the fallback timeout message you are answering, and only when that recheck produced nothing you need later; it drops the recheck from the active conversation while the wait continues.",
 			"yield_goal is terminal: make it the sole final tool action and do not call subagent_wait, ask_user_question, or another tool afterward.",
@@ -656,7 +664,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			type: "object",
 			properties: {
 				reason: { type: "string", description: "Bounded diagnostic reason for the external prerequisite." },
-				timeoutSeconds: { type: "integer", minimum: 30, maximum: 600, description: "Optional one-shot fallback timeout in seconds; defaults to 300." },
+				timeoutSeconds: { type: "integer", minimum: 30, maximum: 600, description: "Optional one-shot fallback timeout in seconds; defaults to 270." },
 				discardToken: { type: "string", description: "Optional token from the fallback timeout message being answered. Supply it only when this recheck produced nothing worth keeping; the recheck is then dropped from the active conversation and the wait continues." },
 			},
 			required: ["reason"],
@@ -762,25 +770,6 @@ export default function piGoal(pi: ExtensionAPI) {
 		return message === event.message ? undefined : { message: message as any };
 	});
 
-	pi.on("context", (event) => {
-		let messages = event.messages as any[];
-		if (resumeMarkerPending && goal?.status === "active") {
-			resumeMarkerPending = false;
-			messages = [
-				...messages,
-				{
-					role: "custom",
-					customType: EVENT_TYPE,
-					content: resumeMarker(goal),
-					display: true,
-					details: { kind: "resumed", goal, resume: true, timestamp: Date.now() },
-					timestamp: Date.now(),
-				},
-			] as any;
-		}
-		return { messages };
-	});
-
 	pi.registerCommand("goal", {
 		description: "Set, view, pause, resume, clear, or configure a long-running goal",
 		getArgumentCompletions: (prefix) => {
@@ -868,7 +857,6 @@ export default function piGoal(pi: ExtensionAPI) {
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
 		continuationQueued = false;
-		resumeMarkerPending = false;
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
 		// Keep create_goal available, and hide read/update tools unless there is an active goal to pursue.
@@ -927,29 +915,58 @@ export default function piGoal(pi: ExtensionAPI) {
 		if (goal) clearDiscardState();
 	});
 
+	pi.on("session_before_tree", () => {
+		if (internalTreeNavigation) return;
+		// Navigation intent revokes process-local authority before Pi starts optional branch
+		// summarization. If another extension cancels navigation, explicit user activity has
+		// still safely stopped this autonomous wait.
+		clearYieldTimeout();
+		clearDiscardState();
+		clearCompactionTracking();
+		continuationQueued = false;
+	});
+
+	pi.on("session_tree", (_event, ctx) => {
+		if (internalTreeNavigation) return;
+		clearYieldTimeout();
+		clearDiscardState();
+		clearCompactionTracking();
+		continuationQueued = false;
+		activeTurnStartedAt = null;
+		activeGoalThisTurnId = null;
+		const restored = latestStateFromSession(ctx);
+		goal = restored.goal;
+		statusBarEnabled = restored.statusBarEnabled;
+		if (restored.diagnostic) ctx.ui.notify(`Goal state ignored safely: ${restored.diagnostic}`, "warning");
+		if (goal?.status === "active" || goal?.status === "yielded") {
+			const paused = { ...goal, status: "paused" as const, updatedAt: Date.now() };
+			const outcome = persist(pi, ctx, paused, "revoke");
+			if (!reportPersistenceFailure(ctx, "Goal tree navigation pause revoked autonomy in memory but is nondurable", outcome)) {
+				ctx.ui.notify(
+					`‖ Goal paused after tree navigation: ${truncateObjective(paused.objective)}\nUse /goal resume to continue, or /goal clear to stop.`,
+					"info",
+				);
+			}
+			return;
+		}
+		updateStatusBar(ctx);
+		syncGoalTools(pi);
+	});
+
 	pi.on("turn_start", (_event, ctx) => {
-		// A native queued event is authoritative: it starts the next turn and
-		// wakes a yielded goal without manufacturing another queue item.
+		activeTurnStartedAt = Date.now();
 		if (goal?.status === "yielded") {
 			clearYieldTimeout();
-			// A wake this extension did not schedule is a real external event, and that is what
-			// ends a wait sequence. A fallback wake continues the one already running.
+			// The input entry that caused this native turn is already persistent. It is the
+			// sole wake marker; this hook only acquires authority before provider work.
 			const fallbackWake = discardPermit?.goalId === goal.id;
 			if (!fallbackWake) clearDiscardState();
 			const resumed = resumeGoalState(fallbackWake ? goal : endWaitSequence(goal));
 			if (resumed) {
-				// Persist while the in-memory authority is still yielded. If the
-				// durable witness rejects the transition, the owner rolls back yielded.
 				const outcome = persist(pi, ctx, resumed, "acquire");
-				if (outcome.persisted) {
-					resumeMarkerPending = true;
-				} else {
-					resumeMarkerPending = false;
-					reportPersistenceFailure(ctx, "Goal resume remained yielded and nondurable", outcome);
-				}
+				if (!outcome.persisted) reportPersistenceFailure(ctx, "Goal resume remained yielded and nondurable", outcome);
 			}
 		}
-		activeTurnStartedAt = Date.now();
 		activeGoalThisTurnId = goal?.status === "active" ? goal.id : null;
 	});
 

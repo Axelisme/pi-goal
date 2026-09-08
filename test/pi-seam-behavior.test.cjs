@@ -144,8 +144,8 @@ test("reload pauses active goals and failed resume persistence remains yielded",
 	await h.tools.get("create_goal").execute("create", { objective: "resume transaction" }, null, null, h.ctx);
 	await h.tools.get("yield_goal").execute("yield", { reason: "external event" }, null, null, h.ctx);
 	h.setAppendThrows(true);
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	assert.equal(h.entries.at(-1).data.goal.status, "yielded", "failed resume keeps the durable witness yielded");
 	assert.equal(h.notices.some((notice) => String(notice).includes("resume remained yielded")), true);
-	const context = h.handlers.get("context")({ messages: [{ role: "user", content: [{ type: "text", text: "event" }] }] }, h.ctx);
-	assert.equal(context.messages.length, 1, "failed resume must not inject a marker");
+	h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx);
 });
