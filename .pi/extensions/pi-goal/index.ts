@@ -73,6 +73,10 @@ type ArmedYieldTimeout = {
 	due: boolean;
 };
 
+type CompactionOwner = {
+	generation: number;
+};
+
 let goal: GoalState | null = null;
 let statusBarEnabled = true;
 let yieldTimeoutSetting: YieldTimeoutSetting = { milliseconds: DEFAULT_YIELD_TIMEOUT_MS, label: "29m" };
@@ -82,7 +86,8 @@ let activeTurnStartedAt: number | null = null;
 let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
 let pendingYield: PendingYield | null = null;
-let compactionActive = false;
+let compactionGeneration = 0;
+let activeCompaction: CompactionOwner | null = null;
 // Pi exposes input source and prompt acceptance through separate, unkeyed callbacks.
 // Keep only a bounded candidate summary: any overlapping or still-unresolved candidate
 // makes the eventual wake unknown rather than guessing which prompt was accepted.
@@ -108,6 +113,7 @@ function clearPendingWaitWork() {
 	pendingYield = null;
 	cancelYieldTimeout();
 	clearPendingWakeSource();
+	clearCompactionTracking();
 }
 
 const TIMEOUT_USAGE = "Usage: /goal timeout status | /goal timeout set <positive integer>s|m|h";
@@ -234,7 +240,7 @@ function armYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalSta
 			}
 			operation.handle = null;
 			operation.due = true;
-			if (!ctx.isIdle() || ctx.hasPendingMessages() || compactionActive || pendingYield?.compactRequested) return;
+			if (!ctx.isIdle() || ctx.hasPendingMessages() || activeCompaction !== null || pendingYield?.compactRequested) return;
 			deliverYieldTimeout(pi, ctx, operation);
 		}, yieldTimeoutSetting.milliseconds);
 		operation.handle = handle;
@@ -257,10 +263,15 @@ function timeoutStatusText(ctx: ExtensionContext): string {
 	return `Configured yield timeout: ${yieldTimeoutSetting.label}\nActive deadline: ${new Date(operation.deadline).toISOString()}\nRemaining: ${remaining}s`;
 }
 
-// A session boundary disowns an in-flight compaction request: its callbacks belong to a
-// runtime this process no longer speaks for, and a stuck flag would block every later wake.
+// A lifecycle boundary disowns an in-flight compaction request: its callbacks belong to
+// a runtime this process no longer speaks for, and a stuck owner would block every later wake.
 function clearCompactionTracking() {
-	compactionActive = false;
+	compactionGeneration += 1;
+	activeCompaction = null;
+}
+
+function ownsCompaction(owner: CompactionOwner): boolean {
+	return activeCompaction === owner && owner.generation === compactionGeneration;
 }
 
 function readContextTokens(ctx: ExtensionContext): number | null {
@@ -549,7 +560,7 @@ function maybeDeliverDueYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext) {
 		if (armedYieldTimeout === operation) armedYieldTimeout = null;
 		return;
 	}
-	if (!ctx.isIdle() || ctx.hasPendingMessages() || compactionActive || pendingYield?.compactRequested) return;
+	if (!ctx.isIdle() || ctx.hasPendingMessages() || activeCompaction !== null || pendingYield?.compactRequested) return;
 	deliverYieldTimeout(pi, ctx, operation);
 }
 
@@ -579,7 +590,7 @@ function settlePendingYield(pi: ExtensionAPI, ctx: ExtensionContext, pending: Pe
 		pendingYield = null;
 		return;
 	}
-	if (!ctx.isIdle() || compactionActive) return;
+	if (!ctx.isIdle() || activeCompaction !== null) return;
 	pendingYield = null;
 	runPendingCompaction(pi, ctx, pending, () => maybeDeliverDueYieldTimeout(pi, ctx));
 }
@@ -600,25 +611,29 @@ function runPendingCompaction(_pi: ExtensionAPI, ctx: ExtensionContext, pending:
 		onSettled?.();
 		return;
 	}
-	compactionActive = true;
+	const owner: CompactionOwner = { generation: compactionGeneration + 1 };
+	compactionGeneration = owner.generation;
+	activeCompaction = owner;
 	const finish = () => {
-		compactionActive = false;
+		if (!ownsCompaction(owner)) return;
+		activeCompaction = null;
 		onSettled?.();
 	};
 	try {
 		compact.call(ctx, {
 			onComplete: () => {
-				if (!compactionActive) return;
+				if (!ownsCompaction(owner)) return;
 				finish();
 			},
 			onError: (error: unknown) => {
-				if (!compactionActive) return;
+				if (!ownsCompaction(owner)) return;
 				ctx.ui.notify(`Goal yield compaction failed: ${String(error)}`, "warning");
 				finish();
 			},
 		});
 	} catch (error) {
-		compactionActive = false;
+		if (!ownsCompaction(owner)) return;
+		activeCompaction = null;
 		ctx.ui.notify(`Goal yield compaction failed: ${String(error)}`, "warning");
 		onSettled?.();
 	}
@@ -779,6 +794,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			}
 			const previous = goal;
 			clearPendingWakeSource();
+			clearCompactionTracking();
 			const next = createGoalState(objective, parsedBudget.tokenBudget);
 			const outcome = persist(pi, ctx, next, goal ? "retain" : "acquire");
 			if (!outcome.persisted) throw new Error(outcome.diagnostic ?? "Goal persistence failed.");
@@ -830,6 +846,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			// existing compaction step and this terminal tool call only records the request.
 			const contextTokens = readContextTokens(ctx);
 			const previous = goal;
+			clearCompactionTracking();
 			const outcome = persist(pi, ctx, next, "revoke");
 			if (outcome.persisted) {
 				if (!previous || previous.waitId !== next.waitId) recordWaitStarted(pi, ctx, next);
@@ -885,6 +902,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			const now = Date.now();
 			const previous = goal;
 			const next: GoalState = { ...endWaitSequence(goal), status: "complete", updatedAt: now };
+			clearCompactionTracking();
 			const outcome = persist(pi, ctx, next, "revoke");
 			if (reportPersistenceFailure(ctx, "Goal completion is terminal in memory but nondurable", outcome)) return { content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, persisted: false, diagnostic: outcome.diagnostic }) }], details: outcome } as any;
 			recordWaitEndAfterPersist(pi, ctx, previous, outcome, "completed");
@@ -959,6 +977,7 @@ export default function piGoal(pi: ExtensionAPI) {
 				}
 				const previous = goal;
 				clearPendingWakeSource();
+				clearCompactionTracking();
 				const outcome = persist(pi, ctx, null, "revoke");
 				if (reportPersistenceFailure(ctx, "Goal clear is stopped in memory but nondurable", outcome)) return;
 				recordWaitEndAfterPersist(pi, ctx, previous, outcome, "cleared");
@@ -974,6 +993,7 @@ export default function piGoal(pi: ExtensionAPI) {
 				const status: GoalStatus = trimmed === "pause" ? "paused" : "active";
 				const previous = goal;
 				clearPendingWakeSource();
+				clearCompactionTracking();
 				const next = { ...endWaitSequence(goal), status, updatedAt: now };
 				const outcome = persist(pi, ctx, next, status === "paused" ? "revoke" : "acquire");
 				if (reportPersistenceFailure(ctx, `Goal ${trimmed} was not persisted`, outcome)) return;
@@ -998,6 +1018,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			}
 			const previous = goal;
 			clearPendingWakeSource();
+			clearCompactionTracking();
 			const next = createGoalState(parsed.objective, parsed.tokenBudget, now);
 			const outcome = persist(pi, ctx, next, goal ? "retain" : "acquire");
 			if (reportPersistenceFailure(ctx, "Goal replacement rolled back", outcome)) return;
@@ -1008,7 +1029,6 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("session_start", (event, ctx) => {
 		clearPendingWaitWork();
-		clearCompactionTracking();
 		goalFooterInstalled = false;
 		const restored = latestStateFromSession(ctx);
 		goal = restored.goal;
@@ -1114,13 +1134,11 @@ export default function piGoal(pi: ExtensionAPI) {
 		// Navigation intent revokes process-local work before Pi selects a branch. If
 		// another extension cancels navigation, the old wait still cannot wake itself.
 		clearPendingWaitWork();
-		clearCompactionTracking();
 		continuationQueued = false;
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
 		clearPendingWaitWork();
-		clearCompactionTracking();
 		continuationQueued = false;
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
@@ -1146,6 +1164,7 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_start", (_event, ctx) => {
+		clearCompactionTracking();
 		activeTurnStartedAt = Date.now();
 		if (goal?.status === "yielded") {
 			// Only one candidate confirmed by before_agent_start can carry its source
@@ -1226,7 +1245,6 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		clearPendingWaitWork();
-		clearCompactionTracking();
 		if (goal?.status !== "yielded") return;
 		const previous = goal;
 		const paused = { ...endWaitSequence(goal), status: "paused" as const, updatedAt: Date.now() };
