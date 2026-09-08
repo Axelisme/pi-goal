@@ -354,6 +354,37 @@ test("a timeout due during compaction delivers once after completion or error", 
 	}
 });
 
+test("a stale compaction callback cannot release a newer wait", options, async (t) => {
+	const timers = enableTimers(t);
+	for (const staleCallback of ["complete", "error"]) {
+		const h = makeHarness({ contextTokens: 150_000 });
+		await install(h);
+		await h.commands.get("goal").handler("timeout set 1s", h.ctx);
+		await createGoal(h, `old ${staleCallback}`);
+		await yieldGoal(h);
+		await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+		assert.equal(h.compactions.length, 1, `${staleCallback}: old compaction started`);
+
+		await h.handlers.get("session_start")({ reason: "reload" }, h.ctx);
+		await createGoal(h, `new ${staleCallback}`);
+		await yieldGoal(h);
+		await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+		assert.equal(h.compactions.length, 2, `${staleCallback}: new compaction started`);
+		h.sent.length = 0;
+
+		if (staleCallback === "complete") h.compactions[0].onComplete({});
+		else h.compactions[0].onError(new Error("late old compaction"));
+		t.mock.timers.tick(1_000);
+		assert.equal(lastGoal(h).status, "yielded", `${staleCallback}: old callback cannot release new compaction`);
+		assert.equal(h.sent.filter(({ message }) => message.details?.kind === "timeout").length, 0, `${staleCallback}: no delivery before new compaction settles`);
+
+		h.compactions[1].onComplete({});
+		assert.equal(lastGoal(h).status, "paused", `${staleCallback}: new owner releases timeout`);
+		assert.equal(h.sent.filter(({ message }) => message.details?.kind === "timeout").length, 1, `${staleCallback}: exactly one delivery`);
+		await assertNoActiveTimeout(h, timers, `stale compaction ${staleCallback}`);
+	}
+});
+
 test("lifecycle boundaries revoke a stale timeout", options, async (t) => {
 	const timers = enableTimers(t);
 	for (const transition of ["pause", "clear", "replace", "reload", "tree", "interrupt", "shutdown"]) {
