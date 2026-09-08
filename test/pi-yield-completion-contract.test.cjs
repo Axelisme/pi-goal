@@ -65,7 +65,10 @@ async function createYielded(h, objective = "wait for the provider", reason = "p
 }
 
 function lastGoal(h) {
-	return h.entries.at(-1)?.data?.goal;
+	for (let i = h.entries.length - 1; i >= 0; i--) {
+		if (h.entries[i].customType === "pi-goal") return h.entries[i].data?.goal;
+	}
+	return undefined;
 }
 
 function flushMicrotasks() {

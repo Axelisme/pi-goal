@@ -27,11 +27,10 @@ export type GoalState = {
 	waitPolicyReason?: WaitPolicyReason;
 };
 
-type LegacyGoalState = Omit<GoalState, "version" | "status" | "waitStartedAt" | "waitTimeouts"> & { version: 1; status: Exclude<GoalStatus, "yielded"> };
-
-export type GoalEventKind = "active" | "continuation" | "yielded" | "yield_timeout" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
+export type GoalEventKind = "active" | "continuation" | "yielded" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
 
 const VALID_STATUSES = new Set<GoalStatus>(["active", "yielded", "paused", "budget_limited", "complete"]);
+let waitSequenceCounter = 0;
 
 function finiteNonNegative(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
@@ -85,19 +84,28 @@ export function restoreGoalState(value: unknown): RestoreGoalResult {
 		base.yieldReason = normalizeYieldReason(raw.yieldReason)!;
 		base.yieldedAt = finiteNonNegative(raw.yieldedAt) ? raw.yieldedAt : base.updatedAt;
 	}
-	// A record written before v3 carries no wait sequence, so it restores as a goal that has
-	// waited through zero timeouts rather than as one with an unknown history.
-	if (finiteNonNegative(raw.waitStartedAt)) {
-		base.waitStartedAt = raw.waitStartedAt;
-		base.waitTimeouts = finiteNonNegative(raw.waitTimeouts) ? Math.floor(raw.waitTimeouts) : 0;
-		if (raw.version === GOAL_STATE_VERSION) {
-			if (typeof raw.waitId !== "string" || !raw.waitId || raw.expectWakeBy !== "user" && raw.expectWakeBy !== "event") {
-				return { goal: null, diagnostic: "Goal state has malformed observable wait fields.", migrated: false };
-			}
-			base.waitId = raw.waitId;
-			base.expectWakeBy = raw.expectWakeBy;
-			if (raw.waitPolicyReason === "user_away_prior" || raw.waitPolicyReason === "insufficient_evidence") base.waitPolicyReason = raw.waitPolicyReason;
+
+	const hasWaitData = ["waitId", "waitStartedAt", "waitTimeouts", "expectWakeBy", "waitPolicyReason"].some((key) => raw[key] !== undefined);
+	const hasWaitStart = finiteNonNegative(raw.waitStartedAt);
+	if (raw.version === GOAL_STATE_VERSION && (base.status === "yielded" || hasWaitData)) {
+		const validWaitCount = raw.waitTimeouts === undefined || Number.isInteger(raw.waitTimeouts) && finiteNonNegative(raw.waitTimeouts);
+		const validWaitIdentity = typeof raw.waitId === "string" && raw.waitId.length > 0;
+		const validWakeBy = raw.expectWakeBy === "user" || raw.expectWakeBy === "event";
+		const policyProvided = raw.waitPolicyReason !== undefined;
+		const validPolicy = !policyProvided || raw.waitPolicyReason === "user_away_prior" || raw.waitPolicyReason === "insufficient_evidence";
+		if (!hasWaitStart || !validWaitCount || !validWaitIdentity || !validWakeBy || !validPolicy) {
+			return { goal: null, diagnostic: "Goal state has malformed observable wait fields.", migrated: false };
 		}
+		base.waitId = raw.waitId;
+		base.waitStartedAt = raw.waitStartedAt;
+		base.waitTimeouts = raw.waitTimeouts === undefined ? 0 : raw.waitTimeouts;
+		base.expectWakeBy = raw.expectWakeBy;
+		if (policyProvided) base.waitPolicyReason = raw.waitPolicyReason;
+	} else if (hasWaitStart) {
+		// v1-v3 wait history is retained, but its source and identity are unknown. A
+		// restored yielded record is paused by the runtime before it can acquire authority.
+		base.waitStartedAt = raw.waitStartedAt;
+		base.waitTimeouts = Number.isInteger(raw.waitTimeouts) && finiteNonNegative(raw.waitTimeouts) ? raw.waitTimeouts : 0;
 	}
 	return { goal: base, migrated: raw.version !== GOAL_STATE_VERSION };
 }
@@ -168,7 +176,6 @@ export function goalEventStatus(kind: GoalEventKind): string {
 		active: "active",
 		continuation: "continuing",
 		yielded: "yielded",
-		yield_timeout: "yield timed out",
 		paused: "paused",
 		resumed: "resumed",
 		cleared: "cleared",
@@ -192,19 +199,24 @@ export function createGoalState(objective: string, tokenBudget: number | null, n
 	};
 }
 
+/**
+ * Open a wait owned by this goal. A same-source re-yield keeps the wait identity,
+ * start time, and historical fallback count; a changed source starts a new wait.
+ * This transition is pure and does not infer source from the diagnostic reason.
+ */
 export function yieldGoalState(state: GoalState, reason: unknown, expectWakeBy: ExpectedWakeBy, waitPolicyReason: WaitPolicyReason, now = Date.now()): GoalState | null {
 	const normalized = normalizeYieldReason(reason);
 	if (state.status !== "active" || !normalized) return null;
 	const sameWait = state.waitStartedAt != null && state.expectWakeBy === expectWakeBy;
 	const waitStartedAt = sameWait ? state.waitStartedAt! : now;
 	const waitTimeouts = sameWait ? state.waitTimeouts ?? 0 : 0;
-	const waitId = sameWait && state.waitId ? state.waitId : `wait-${state.id}-${now}`;
+	const waitId = sameWait && state.waitId ? state.waitId : `wait-${state.id}-${now}-${++waitSequenceCounter}`;
 	return { ...state, version: GOAL_STATE_VERSION, status: "yielded", yieldReason: normalized, yieldedAt: now, updatedAt: now, waitId, waitStartedAt, waitTimeouts, expectWakeBy, waitPolicyReason };
 }
 
-/** End the current wait sequence. A real external wake, not a fallback timeout, is what ends one. */
+/** End the current wait sequence before a native wake or lifecycle boundary is persisted. */
 export function endWaitSequence(state: GoalState): GoalState {
-	if (state.waitStartedAt == null && state.waitTimeouts == null && state.waitId == null && state.expectWakeBy == null) return state;
+	if (state.waitStartedAt == null && state.waitTimeouts == null && state.waitId == null && state.expectWakeBy == null && state.waitPolicyReason == null) return state;
 	const next = { ...state, version: GOAL_STATE_VERSION };
 	delete next.waitId;
 	delete next.waitStartedAt;
@@ -214,26 +226,11 @@ export function endWaitSequence(state: GoalState): GoalState {
 	return next;
 }
 
-/** Record one delivered fallback timeout against the current wait sequence. */
-export function countYieldTimeout(state: GoalState, now = Date.now()): GoalState {
-	return {
-		...state,
-		version: GOAL_STATE_VERSION,
-		waitStartedAt: state.waitStartedAt ?? now,
-		waitTimeouts: (state.waitTimeouts ?? 0) + 1,
-	};
-}
-
-/** Whole seconds the current wait sequence has run, or 0 when no sequence is open. */
-export function waitElapsedSeconds(state: GoalState, now = Date.now()): number {
-	if (state.waitStartedAt == null) return 0;
-	return Math.max(0, Math.round((now - state.waitStartedAt) / 1000));
-}
-
 // Alias kept deliberately generic for consumers testing the public lifecycle seam.
 export const transitionGoalToYielded = yieldGoalState;
 export const createYieldedGoalState = yieldGoalState;
 
+/** Resume only an explicit/native lifecycle wake; callers end a wait before persistence. */
 export function resumeGoalState(state: GoalState, now = Date.now()): GoalState | null {
 	if (state.status !== "yielded" && state.status !== "paused") return null;
 	const next = { ...state, version: GOAL_STATE_VERSION, status: "active" as const, updatedAt: now };

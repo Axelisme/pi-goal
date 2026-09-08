@@ -7,6 +7,13 @@ const { createJiti } = require("jiti");
 const globalPi = "/usr/lib/node_modules/@earendil-works/pi-coding-agent";
 const options = existsSync(globalPi) ? {} : { skip: "Pi 0.81.1 global runtime is unavailable" };
 
+function lastGoal(entries) {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		if (entries[i].customType === "pi-goal") return entries[i].data?.goal;
+	}
+	return undefined;
+}
+
 function harness() {
 	const handlers = new Map();
 	const tools = new Map();
@@ -68,7 +75,7 @@ test("failed yield persistence remains terminal and does not start another provi
 		const stream = createAssistantMessageEventStream();
 		const message = {
 			role: "assistant",
-			content: [{ type: "toolCall", id: "yield-call", name: "yield_goal", arguments: { reason: "provider completion" } }],
+			content: [{ type: "toolCall", id: "yield-call", name: "yield_goal", arguments: { reason: "provider completion", expect_wake_by: "event" } }],
 			api: "test", provider: "test", model: model.id,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 			stopReason: "toolUse", timestamp: Date.now(),
@@ -82,7 +89,7 @@ test("failed yield persistence remains terminal and does not start another provi
 	await agent.prompt("external prerequisite");
 	assert.equal(providerCalls, 1);
 	assert.equal(h.sent.length, 0, "failed yield must not publish or queue a marker");
-	assert.equal(h.entries.at(-1).data.goal.status, "active", "durable witness remains unchanged");
+	assert.equal(lastGoal(h.entries).status, "active", "durable witness remains unchanged");
 	assert.equal(JSON.stringify(agent.state.messages).includes('"persisted":false'), true, "terminal result exposes nondurable evidence");
 	// The owner has failed closed in memory; agent_end cannot queue continuation.
 	assert.equal(h.handlers.get("agent_end")({}, h.ctx), undefined);

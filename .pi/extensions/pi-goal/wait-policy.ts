@@ -8,12 +8,13 @@ export type WaitPolicyDecision = {
 };
 
 /**
- * Decide whether the runtime should buy another wake while a goal is yielded.
+ * Decide the conservative action for one explicit expected wake source.
  *
- * This first tracer deliberately has no scheduling variant: user waits assume the
- * user is away, while event waits lack the calibrated forecast and complete cost
- * evidence needed to justify a paid request. The caller owns persistence, timers,
- * messages, and Pi context; this policy owns none of those effects.
+ * This first tracer deliberately has no scheduling or paid-heartbeat variant: a
+ * user wait assumes the user is away, while an event wait lacks calibrated forecast
+ * and complete cost evidence. The caller owns persistence, observations, lifecycle,
+ * timers, messages, and Pi context; this pure policy owns none of those effects.
+ * Unknown wake provenance is handled by runtime observation and never inferred here.
  */
 export function decideWait(expectWakeBy: ExpectedWakeBy): WaitPolicyDecision {
 	return expectWakeBy === "user"
