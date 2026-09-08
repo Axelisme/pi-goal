@@ -261,6 +261,26 @@ test("a handled interactive input cannot label an unrelated native wake", option
 	assert.equal(observations(h).at(-1).wakeSource, "unknown");
 });
 
+test("a handled non-interactive input cannot poison a later accepted interactive wake", options, async () => {
+	const h = makeHarness();
+	await install(h);
+	await createGoal(h);
+	await yieldGoal(h, "event", "waiting for a handled prompt");
+
+	let handled = true;
+	h.addInputHandler(() => {
+		if (!handled) return undefined;
+		handled = false;
+		return { action: "handled" };
+	});
+	const consumed = await h.dispatchInput({ type: "input", source: "rpc", text: "handled" });
+	assert.equal(consumed.action, "handled");
+
+	await acceptedInput(h, "interactive");
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	assert.equal(observations(h).at(-1).wakeSource, "user");
+});
+
 test("/goal status reports the expected source and quiet heartbeat state", options, async () => {
 	const h = makeHarness();
 	await install(h);

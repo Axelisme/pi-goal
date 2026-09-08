@@ -877,10 +877,10 @@ export default function piGoal(pi: ExtensionAPI) {
 		}
 		// A newer input must prove its own acceptance; it cannot inherit a
 		// previously confirmed source while its handlers are still running.
+		// Each input is a separate prompt candidate, so a handled candidate must
+		// not poison provenance for the next input that Pi accepts.
 		pendingWakeSource = null;
-		const candidate = classifyInputSource((event as any).source);
-		if (pendingInputWakeSource == null) pendingInputWakeSource = candidate;
-		else if (pendingInputWakeSource !== candidate) pendingInputWakeSource = "unknown";
+		pendingInputWakeSource = classifyInputSource((event as any).source);
 	});
 
 	pi.on("before_agent_start", () => {
