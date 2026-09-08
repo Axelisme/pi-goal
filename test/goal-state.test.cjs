@@ -5,7 +5,6 @@ const { createJiti } = require("jiti");
 const jiti = createJiti(__filename);
 const {
 	accountGoalTurn,
-	countYieldTimeout,
 	createGoalState,
 	endWaitSequence,
 	formatElapsed,
@@ -18,11 +17,9 @@ const {
 	goalEventStatus,
 	goalUsage,
 	normalizeTokenBudget,
-	normalizeYieldTimeoutSeconds,
 	parseTokenBudget,
 	statusLine,
 	truncateObjective,
-	waitElapsedSeconds,
 } = jiti("../.pi/extensions/pi-goal/goal-state.ts");
 
 test("parseTokenBudget returns trimmed objective with no budget", () => {
@@ -86,18 +83,6 @@ test("normalizeTokenBudget rejects non-positive and non-numeric values", () => {
 	});
 });
 
-test("yield timeout defaults to 270 seconds and enforces finite integer bounds", () => {
-	assert.deepEqual(normalizeYieldTimeoutSeconds(undefined), { timeoutSeconds: 270 });
-	assert.deepEqual(normalizeYieldTimeoutSeconds(30), { timeoutSeconds: 30 });
-	assert.deepEqual(normalizeYieldTimeoutSeconds(600), { timeoutSeconds: 600 });
-	for (const value of [0, 29, 601, 30.5, Number.NaN, Number.POSITIVE_INFINITY, "300"]) {
-		assert.deepEqual(normalizeYieldTimeoutSeconds(value), {
-			timeoutSeconds: null,
-			error: "timeoutSeconds must be an integer between 30 and 600 seconds.",
-		});
-	}
-});
-
 test("formatTokens uses compact K and M suffixes", () => {
 	assert.equal(formatTokens(999), "999");
 	assert.equal(formatTokens(1_000), "1K");
@@ -137,14 +122,13 @@ test("goalEventStatus maps event kinds to display labels", () => {
 	assert.equal(goalEventStatus("active"), "active");
 	assert.equal(goalEventStatus("continuation"), "continuing");
 	assert.equal(goalEventStatus("yielded"), "yielded");
-	assert.equal(goalEventStatus("yield_timeout"), "yield timed out");
 	assert.equal(goalEventStatus("budget_limited"), "budget reached");
 	assert.equal(goalEventStatus("complete"), "achieved");
 });
 
 test("createGoalState creates a deterministic active goal when time and random are supplied", () => {
 	assert.deepEqual(createGoalState("ship it", 123, 42, 0.5), {
-		version: 3,
+		version: 4,
 		id: "42-8",
 		objective: "ship it",
 		status: "active",
@@ -160,10 +144,9 @@ test("older state migrates losslessly and arrives with no open wait sequence", (
 	for (const version of [1, 2]) {
 		const restored = restoreGoalState({ version, id: "old", objective: "keep going", status: "active", tokenBudget: null, tokensUsed: 2, timeUsedSeconds: 3, createdAt: 4, updatedAt: 5 });
 		assert.equal(restored.migrated, true, `v${version}`);
-		assert.equal(restored.goal.version, 3, `v${version}`);
+		assert.equal(restored.goal.version, 4, `v${version}`);
 		assert.equal(restored.goal.status, "active", `v${version}`);
 		assert.equal(restored.goal.waitStartedAt, undefined, `v${version}`);
-		assert.equal(waitElapsedSeconds(restored.goal, 9_000), 0, `v${version}`);
 	}
 	assert.equal(restoreGoalState({ version: 99 }).goal, null);
 });
@@ -174,41 +157,55 @@ test("a restored v3 record keeps its wait sequence", () => {
 		yieldedAt: 5_000, tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 0, updatedAt: 5_000,
 		waitStartedAt: 1_000, waitTimeouts: 4,
 	});
-	assert.equal(restored.migrated, false);
+	assert.equal(restored.migrated, true);
 	assert.equal(restored.goal.waitStartedAt, 1_000);
 	assert.equal(restored.goal.waitTimeouts, 4);
-	assert.equal(waitElapsedSeconds(restored.goal, 61_000), 60);
 });
 
-test("a wait sequence spans timeouts and ends only when it is ended", () => {
+test("a v4 yielded record restores its identity and source", () => {
+	const restored = restoreGoalState({
+		version: 4, id: "waiting-v4", objective: "await a child", status: "yielded", yieldReason: "child running",
+		yieldedAt: 5_000, tokenBudget: null, tokensUsed: 2, timeUsedSeconds: 3, createdAt: 0, updatedAt: 5_000,
+		waitId: "wait-1", waitStartedAt: 1_000, expectWakeBy: "event", waitPolicyReason: "insufficient_evidence",
+	});
+	assert.equal(restored.migrated, false);
+	assert.equal(restored.goal.waitId, "wait-1");
+	assert.equal(restored.goal.expectWakeBy, "event");
+	assert.equal(restored.goal.waitTimeouts, 0);
+	assert.equal(restoreGoalState({
+		version: 4, id: "bad", objective: "await", status: "yielded", yieldReason: "waiting",
+		tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 0, updatedAt: 1,
+		waitStartedAt: 1, expectWakeBy: "event",
+	}).goal, null);
+});
+
+test("a wait identity survives same-source re-yield and ends before a new source", () => {
 	const goal = createGoalState("await a child", null, 1_000, 0.5);
-	const first = yieldGoalState(goal, "child running", 2_000);
+	const first = yieldGoalState(goal, "child running", "event", "insufficient_evidence", 2_000);
 	assert.equal(first.waitStartedAt, 2_000);
 	assert.equal(first.waitTimeouts, 0);
+	assert.equal(first.expectWakeBy, "event");
+	const waitId = first.waitId;
 
-	const woken = countYieldTimeout(first, 302_000);
-	assert.equal(woken.waitTimeouts, 1);
-	assert.equal(waitElapsedSeconds(woken, 302_000), 300);
+	// No synthetic timeout is part of this tracer; same-source state can still be
+	// represented without resetting its identity or historical count.
+	const sameSource = yieldGoalState(endWaitSequence(resumeGoalState(first, 302_100)), "child still running", "event", "insufficient_evidence", 302_200);
+	assert.equal(sameSource.waitStartedAt, 302_200, "a real wake ends the old wait before the next yield");
+	assert.notEqual(sameSource.waitId, waitId);
 
-	// A timeout recheck resumes and re-yields; the sequence is one wait, not two.
-	const reYielded = yieldGoalState(resumeGoalState(woken, 302_100), "child still running", 302_200);
-	assert.equal(reYielded.waitStartedAt, 2_000);
-	assert.equal(reYielded.waitTimeouts, 1);
-	assert.equal(countYieldTimeout(reYielded, 602_000).waitTimeouts, 2);
-
-	// A real external wake ends the sequence, so the next yield starts a fresh one.
-	const external = endWaitSequence(resumeGoalState(reYielded, 400_000));
+	const external = endWaitSequence(resumeGoalState(sameSource, 400_000));
 	assert.equal(external.waitStartedAt, undefined);
-	assert.equal(external.waitTimeouts, undefined);
-	const restarted = yieldGoalState(external, "a different prerequisite", 401_000);
+	assert.equal(external.waitId, undefined);
+	const restarted = yieldGoalState(external, "a different prerequisite", "user", "user_away_prior", 401_000);
 	assert.equal(restarted.waitStartedAt, 401_000);
-	assert.equal(restarted.waitTimeouts, 0);
+	assert.equal(restarted.expectWakeBy, "user");
+	assert.notEqual(restarted.waitId, sameSource.waitId);
 });
 
 test("budget exhaustion ends the wait sequence with the goal", () => {
-	const goal = { ...createGoalState("await a child", 10, 1_000, 0.5), status: "active" };
-	const yielded = yieldGoalState(goal, "child running", 2_000);
-	const limited = accountGoalTurn(countYieldTimeout(yielded, 3_000), 10, 1, 4_000);
+	const goal = createGoalState("await a child", 10, 1_000, 0.5);
+	const yielded = yieldGoalState(goal, "child running", "event", "insufficient_evidence", 2_000);
+	const limited = accountGoalTurn(yielded, 10, 1, 4_000);
 	assert.equal(limited.status, "budget_limited");
 	assert.equal(limited.waitStartedAt, undefined);
 	assert.equal(limited.waitTimeouts, undefined);
@@ -216,10 +213,10 @@ test("budget exhaustion ends the wait sequence with the goal", () => {
 
 test("yield transition validates and bounds a diagnostic reason", () => {
 	const goal = createGoalState("ship it", null, 42, 0.5);
-	const yielded = yieldGoalState(goal, "  waiting\\nfor provider " + "x".repeat(300), 50);
+	const yielded = yieldGoalState(goal, "  waiting\\nfor provider " + "x".repeat(300), "event", "insufficient_evidence", 50);
 	assert.equal(yielded.status, "yielded");
 	assert.equal(yielded.yieldReason.length, 240);
-	assert.equal(yieldGoalState(yielded, "again"), null);
+	assert.equal(yieldGoalState(yielded, "again", "event", "insufficient_evidence"), null);
 	assert.equal(normalizeYieldReason("  \n"), undefined);
 	assert.equal(resumeGoalState(yielded, 60).status, "active");
 });
@@ -249,7 +246,7 @@ test("accountGoalTurn adds usage and marks active budgeted goals budget-limited"
 });
 
 test("yield usage is charged and budget exhaustion takes precedence", () => {
-	const yielded = yieldGoalState(createGoalState("ship it", 10, 42, 0.5), "waiting", 45);
+	const yielded = yieldGoalState(createGoalState("ship it", 10, 42, 0.5), "waiting", "event", "insufficient_evidence", 45);
 	const limited = accountGoalTurn(yielded, 10, 2, 50);
 	assert.equal(limited.status, "budget_limited");
 	assert.equal(limited.tokensUsed, 10);

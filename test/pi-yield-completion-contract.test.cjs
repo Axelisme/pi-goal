@@ -60,12 +60,15 @@ async function install(h, entriesReason = "startup") {
 
 async function createYielded(h, objective = "wait for the provider", reason = "provider completion") {
 	await h.tools.get("create_goal").execute("create", { objective }, null, null, h.ctx);
-	await h.tools.get("yield_goal").execute("yield", { reason }, null, null, h.ctx);
+	await h.tools.get("yield_goal").execute("yield", { reason, expect_wake_by: "event" }, null, null, h.ctx);
 	h.sent.length = 0;
 }
 
 function lastGoal(h) {
-	return h.entries.at(-1)?.data?.goal;
+	for (let i = h.entries.length - 1; i >= 0; i--) {
+		if (h.entries[i].customType === "pi-goal") return h.entries[i].data?.goal;
+	}
+	return undefined;
 }
 
 function flushMicrotasks() {
@@ -74,6 +77,27 @@ function flushMicrotasks() {
 
 const goalTools = ["create_goal", "get_goal", "update_goal", "yield_goal"];
 const stableGoalTools = ["host-tool", ...goalTools];
+
+test("yield_goal exposes explicit wake intent and returns a quiet waiting contract", options, async () => {
+	const h = makeHarness();
+	await install(h);
+	const tool = h.tools.get("yield_goal");
+	assert.deepEqual(tool.parameters.required, ["reason", "expect_wake_by"]);
+	assert.deepEqual(tool.parameters.properties.expect_wake_by.enum, ["user", "event"]);
+	assert.equal(tool.parameters.properties.timeoutSeconds, undefined);
+
+	await h.tools.get("create_goal").execute("create", { objective: "wait for approval" }, null, null, h.ctx);
+	h.sent.length = 0;
+	const result = await tool.execute("yield", { reason: "release owner approval", expect_wake_by: "user" }, null, null, h.ctx);
+	const payload = JSON.parse(result.content[0].text);
+	assert.equal(result.terminate, true);
+	assert.equal(payload.goal.expectWakeBy, "user");
+	assert.equal(payload.waiting.id, payload.goal.waitId);
+	assert.equal(payload.waiting.heartbeat, "waiting_without_heartbeat");
+	assert.equal(payload.waiting.nextHeartbeatAt, null);
+	assert.equal(payload.waiting.reasonCode, "user_away_prior");
+	assert.equal(h.sent.length, 0);
+});
 
 test("goal tools stay stable while lifecycle validity is enforced at execution", options, async () => {
 	const h = makeHarness();
@@ -91,7 +115,7 @@ test("goal tools stay stable while lifecycle validity is enforced at execution",
 
 	await h.tools.get("create_goal").execute("create", { objective: "keep schemas stable" }, null, null, h.ctx);
 	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "creating a goal must not change Tool schemas");
-	await h.tools.get("yield_goal").execute("yield", { reason: "wait" }, null, null, h.ctx);
+	await h.tools.get("yield_goal").execute("yield", { reason: "wait", expect_wake_by: "user" }, null, null, h.ctx);
 	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "yielding must not change Tool schemas");
 	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "resuming must not change Tool schemas");
@@ -134,7 +158,7 @@ test("persisted yielded v2 restore pauses safely with its objective and reason, 
 	const h = makeHarness({ entries: [{ type: "custom", customType: "pi-goal", data: { goal: yielded, statusBarEnabled: true } }] });
 	await install(h, "reload");
 
-	assert.deepEqual(lastGoal(h), { ...yielded, version: 3, status: "paused", updatedAt: lastGoal(h).updatedAt });
+	assert.deepEqual(lastGoal(h), { ...yielded, version: 4, status: "paused", updatedAt: lastGoal(h).updatedAt });
 	assert.equal(lastGoal(h).objective, yielded.objective);
 	assert.equal(lastGoal(h).yieldReason, yielded.yieldReason);
 	assert.match(h.notices.at(-1), /Goal paused after reload\/restore/);
