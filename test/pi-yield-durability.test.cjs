@@ -75,7 +75,7 @@ test("failed yield persistence remains terminal and does not start another provi
 		const stream = createAssistantMessageEventStream();
 		const message = {
 			role: "assistant",
-			content: [{ type: "toolCall", id: "yield-call", name: "yield_goal", arguments: { reason: "provider completion", expect_wake_by: "event" } }],
+			content: [{ type: "toolCall", id: "yield-call", name: "yield_goal", arguments: { reason: "provider completion" } }],
 			api: "test", provider: "test", model: model.id,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 			stopReason: "toolUse", timestamp: Date.now(),

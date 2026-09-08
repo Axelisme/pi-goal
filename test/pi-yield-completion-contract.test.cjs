@@ -60,7 +60,7 @@ async function install(h, entriesReason = "startup") {
 
 async function createYielded(h, objective = "wait for the provider", reason = "provider completion") {
 	await h.tools.get("create_goal").execute("create", { objective }, null, null, h.ctx);
-	await h.tools.get("yield_goal").execute("yield", { reason, expect_wake_by: "event" }, null, null, h.ctx);
+	await h.tools.get("yield_goal").execute("yield", { reason }, null, null, h.ctx);
 	h.sent.length = 0;
 }
 
@@ -112,7 +112,7 @@ test("goal tools stay stable while lifecycle validity is enforced at execution",
 
 	await h.tools.get("create_goal").execute("create", { objective: "keep schemas stable" }, null, null, h.ctx);
 	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "creating a goal must not change Tool schemas");
-	await h.tools.get("yield_goal").execute("yield", { reason: "wait", expect_wake_by: "user" }, null, null, h.ctx);
+	await h.tools.get("yield_goal").execute("yield", { reason: "wait" }, null, null, h.ctx);
 	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "yielding must not change Tool schemas");
 	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "resuming must not change Tool schemas");
@@ -155,7 +155,7 @@ test("persisted yielded v2 restore pauses safely with its objective and reason, 
 	const h = makeHarness({ entries: [{ type: "custom", customType: "pi-goal", data: { goal: yielded, statusBarEnabled: true } }] });
 	await install(h, "reload");
 
-	assert.deepEqual(lastGoal(h), { ...yielded, version: 4, status: "paused", updatedAt: lastGoal(h).updatedAt });
+	assert.deepEqual(lastGoal(h), { ...yielded, version: 5, status: "paused", updatedAt: lastGoal(h).updatedAt });
 	assert.equal(lastGoal(h).objective, yielded.objective);
 	assert.equal(lastGoal(h).yieldReason, yielded.yieldReason);
 	assert.match(h.notices.at(-1), /Goal paused after reload\/restore/);

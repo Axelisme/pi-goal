@@ -22,13 +22,11 @@ import {
 } from "./goal-state";
 import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
 import { createGoalFooter } from "./footer";
-import { decideWait, normalizeExpectedWakeBy } from "./wait-policy";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
 const OBSERVATION_TYPE = "pi-goal-observation";
 const OBSERVATION_VERSION = 1 as const;
-const WAIT_POLICY_VERSION = "conservative-v1" as const;
 const CONTEXT_COMPACTION_THRESHOLD = 100_000;
 
 type WakeSource = "user" | "event" | "unknown";
@@ -153,18 +151,13 @@ function emitGoalEvent(
 type WaitObservation = {
 	version: typeof OBSERVATION_VERSION;
 	observationId: string;
-	kind: "wait_started" | "wait_ended" | "policy_decision";
+	kind: "wait_started" | "wait_ended";
 	goalId: string;
 	waitId: string;
 	timestamp: number;
 	waitStartedAt: number;
-	expectWakeBy?: "user" | "event";
 	wakeSource?: WakeSource;
 	terminationReason?: WaitTerminationReason;
-	policyVersion?: typeof WAIT_POLICY_VERSION;
-	action?: "wait";
-	reasonCode?: "user_away_prior" | "insufficient_evidence";
-	heartbeat?: "waiting_without_heartbeat";
 };
 
 /**
@@ -185,30 +178,13 @@ function appendWaitObservation(pi: ExtensionAPI, ctx: ExtensionContext, observat
 }
 
 function recordWaitStarted(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalState) {
-	if (!state.waitId || state.waitStartedAt == null || !state.expectWakeBy) return;
+	if (!state.waitId || state.waitStartedAt == null) return;
 	appendWaitObservation(pi, ctx, {
 		kind: "wait_started",
 		goalId: state.id,
 		waitId: state.waitId,
 		timestamp: state.waitStartedAt,
 		waitStartedAt: state.waitStartedAt,
-		expectWakeBy: state.expectWakeBy,
-	});
-}
-
-function recordWaitDecision(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalState) {
-	if (!state.waitId || state.waitStartedAt == null || !state.expectWakeBy || !state.waitPolicyReason) return;
-	appendWaitObservation(pi, ctx, {
-		kind: "policy_decision",
-		goalId: state.id,
-		waitId: state.waitId,
-		timestamp: state.updatedAt,
-		waitStartedAt: state.waitStartedAt,
-		expectWakeBy: state.expectWakeBy,
-		policyVersion: WAIT_POLICY_VERSION,
-		action: "wait",
-		reasonCode: state.waitPolicyReason,
-		heartbeat: "waiting_without_heartbeat",
 	});
 }
 
@@ -226,7 +202,6 @@ function recordWaitEnded(
 		waitId: state.waitId,
 		timestamp: Date.now(),
 		waitStartedAt: state.waitStartedAt,
-		expectWakeBy: state.expectWakeBy,
 		wakeSource,
 		terminationReason,
 	});
@@ -253,11 +228,7 @@ function waitingDetails(state: GoalState | null) {
 	if (!state || state.status !== "yielded") return null;
 	return {
 		id: state.waitId ?? null,
-		expectWakeBy: state.expectWakeBy ?? null,
 		startedAt: state.waitStartedAt ?? null,
-		heartbeat: "waiting_without_heartbeat" as const,
-		nextHeartbeatAt: null,
-		reasonCode: state.waitPolicyReason ?? null,
 	};
 }
 
@@ -620,10 +591,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			if (!normalized) {
 				throw new Error("reason is required and must be a non-empty string.");
 			}
-			// Contract seed: the remainder removes this internal compatibility choice with wait-policy.
-			const expectWakeBy = normalizeExpectedWakeBy("event")!;
-			const waitDecision = decideWait(expectWakeBy);
-			const next = yieldGoalState(goal, normalized, expectWakeBy, waitDecision.reason);
+			const next = yieldGoalState(goal, normalized);
 			if (!next) {
 				throw new Error("Unable to yield the current goal.");
 			}
@@ -634,7 +602,6 @@ export default function piGoal(pi: ExtensionAPI) {
 			const outcome = persist(pi, ctx, next, "revoke");
 			if (outcome.persisted) {
 				if (!previous || previous.waitId !== next.waitId) recordWaitStarted(pi, ctx, next);
-				recordWaitDecision(pi, ctx, next);
 				pendingYield = {
 					goalId: next.id,
 					yieldedAt: next.yieldedAt,
@@ -718,7 +685,7 @@ export default function piGoal(pi: ExtensionAPI) {
 
 			if (!trimmed || trimmed === "status") {
 				if (!goal) ctx.ui.notify("Usage: /goal [--tokens 50k] <objective>", "info");
-				else ctx.ui.notify(`${statusLine(goal)}\nObjective: ${goal.objective}${goal.status === "yielded" ? `\nWaiting for: ${goal.yieldReason}\nExpected wake: ${goal.expectWakeBy ?? "unknown"}\nHeartbeat: waiting without heartbeat\nPolicy: ${goal.waitPolicyReason ?? "unknown"}\nWait id: ${goal.waitId ?? "unknown"}` : ""}\nStatus bar: ${statusBarEnabled ? "on" : "off"}`, "info");
+				else ctx.ui.notify(`${statusLine(goal)}\nObjective: ${goal.objective}${goal.status === "yielded" ? `\nWaiting for: ${goal.yieldReason}\nWait id: ${goal.waitId ?? "unknown"}` : ""}\nStatus bar: ${statusBarEnabled ? "on" : "off"}`, "info");
 				return;
 			}
 
@@ -800,12 +767,12 @@ export default function piGoal(pi: ExtensionAPI) {
 			// Unknown or malformed records are deliberately non-autonomous.
 			ctx.ui.notify(`Goal state ignored safely: ${restored.diagnostic}`, "warning");
 		}
-		// v1-v3 fields are migrated only when doing so cannot persist an old yielded
+		// v1-v4 fields are migrated only when doing so cannot persist an old yielded
 		// wait as autonomous authority; any restored wait on a non-yielded state is
 		// explicitly truncated at this session boundary as well.
 		if (goal && goal.status !== "yielded") {
 			const previous = goal;
-			const hasWait = goal.waitId != null || goal.waitStartedAt != null || goal.waitTimeouts != null || goal.expectWakeBy != null || goal.waitPolicyReason != null;
+			const hasWait = goal.waitId != null || goal.waitStartedAt != null || goal.waitTimeouts != null;
 			if (hasWait) {
 				const ended = endWaitSequence(goal);
 				const outcome = persist(pi, ctx, ended, goal.status === "active" ? "retain" : "revoke");
