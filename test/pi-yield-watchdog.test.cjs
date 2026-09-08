@@ -8,13 +8,14 @@ const globalPi = "/usr/lib/node_modules/@earendil-works/pi-coding-agent";
 const options = existsSync(globalPi) ? {} : { skip: "Pi global runtime is unavailable" };
 const minute = 60_000;
 
-function makeHarness({ entries = [], idle = true } = {}) {
+function makeHarness({ entries = [], idle = true, contextTokens } = {}) {
 	const handlers = new Map();
 	const inputHandlers = [];
 	const tools = new Map();
 	const commands = new Map();
 	const sent = [];
 	const notices = [];
+	const compactions = [];
 	let activeTools = ["create_goal"];
 	let appendThrows = false;
 	let isIdle = idle;
@@ -69,8 +70,12 @@ function makeHarness({ entries = [], idle = true } = {}) {
 		isIdle: () => isIdle,
 		hasPendingMessages: () => false,
 	};
+	if (contextTokens !== undefined) {
+		ctx.getContextUsage = () => ({ tokens: contextTokens, contextWindow: 200_000 });
+		ctx.compact = (callbacks) => { compactions.push(callbacks); };
+	}
 	return {
-		pi, ctx, handlers, tools, commands, entries, sent, notices,
+		pi, ctx, handlers, tools, commands, entries, sent, notices, compactions,
 		async dispatchInput(event) {
 			for (const handler of inputHandlers) {
 				const result = await handler(event, ctx);
@@ -126,6 +131,32 @@ async function timeoutStatus(h) {
 
 function enableTimers(t) {
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: Date.parse("2026-09-08T00:00:00.000Z") });
+	const nativeSetTimeout = global.setTimeout;
+	const nativeClearTimeout = global.clearTimeout;
+	const live = new Set();
+	global.setTimeout = (callback, delay, ...args) => {
+		let handle;
+		handle = nativeSetTimeout(() => {
+			live.delete(handle);
+			callback(...args);
+		}, delay);
+		live.add(handle);
+		return handle;
+	};
+	global.clearTimeout = (handle) => {
+		live.delete(handle);
+		return nativeClearTimeout(handle);
+	};
+	t.after(() => {
+		global.setTimeout = nativeSetTimeout;
+		global.clearTimeout = nativeClearTimeout;
+	});
+	return { count: () => live.size };
+}
+
+async function assertNoActiveTimeout(h, timers, label) {
+	assert.equal(timers.count(), 0, `${label}: no live timer handles`);
+	assert.match(await timeoutStatus(h), /Active deadline: none/, `${label}: no active timeout operation`);
 }
 
 test("timeout commands expose the default and persist a valid session setting", options, async () => {
@@ -190,7 +221,7 @@ test("malformed persisted settings fall back to 29m without changing goal schema
 });
 
 test("an armed wait reports its fixed deadline and timeout set affects only the next yield", options, async (t) => {
-	enableTimers(t);
+	const timers = enableTimers(t);
 	const h = makeHarness();
 	await install(h);
 	await createGoal(h);
@@ -206,10 +237,11 @@ test("an armed wait reports its fixed deadline and timeout set affects only the 
 	assert.match(changed, /Active deadline: 2026-09-08T00:29:00.000Z/);
 	t.mock.timers.tick(29 * minute);
 	assert.equal(lastGoal(h).status, "paused");
+	await assertNoActiveTimeout(h, timers, "delivered configured deadline");
 });
 
 test("deadline durably pauses once before publishing one timeout follow-up", options, async (t) => {
-	enableTimers(t);
+	const timers = enableTimers(t);
 	const h = makeHarness();
 	await install(h);
 	await h.commands.get("goal").handler("timeout set 1s", h.ctx);
@@ -235,10 +267,11 @@ test("deadline durably pauses once before publishing one timeout follow-up", opt
 	assert.equal(h.sent.length, 1);
 	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
 	assert.equal(h.sent.length, 1);
+	await assertNoActiveTimeout(h, timers, "one-shot delivery");
 });
 
 test("a real turn cancels timeout while an input candidate alone does not", options, async (t) => {
-	enableTimers(t);
+	const timers = enableTimers(t);
 	const candidate = makeHarness();
 	await install(candidate);
 	await candidate.commands.get("goal").handler("timeout set 1s", candidate.ctx);
@@ -248,6 +281,7 @@ test("a real turn cancels timeout while an input candidate alone does not", opti
 	t.mock.timers.tick(1_000);
 	assert.equal(lastGoal(candidate).status, "paused");
 	assert.equal(candidate.sent.at(-1).message.details.kind, "timeout");
+	await assertNoActiveTimeout(candidate, timers, "input candidate timeout");
 
 	const native = makeHarness();
 	await install(native);
@@ -260,10 +294,11 @@ test("a real turn cancels timeout while an input candidate alone does not", opti
 	assert.equal(lastGoal(native).status, "active");
 	assert.equal(native.sent.length, 0);
 	assert.equal(observations(native).at(-1).terminationReason, "native_wake");
+	await assertNoActiveTimeout(native, timers, "native wake");
 });
 
 test("a due watchdog waits for idle settlement and still delivers at most once", options, async (t) => {
-	enableTimers(t);
+	const timers = enableTimers(t);
 	const h = makeHarness({ idle: false });
 	await install(h);
 	await h.commands.get("goal").handler("timeout set 1s", h.ctx);
@@ -271,8 +306,11 @@ test("a due watchdog waits for idle settlement and still delivers at most once",
 	h.sent.length = 0;
 	await yieldGoal(h);
 	t.mock.timers.tick(1_000);
+	assert.equal(timers.count(), 0, "the fired handle is consumed while delivery waits");
 	assert.equal(lastGoal(h).status, "yielded");
 	assert.equal(h.sent.length, 0);
+	assert.match(await timeoutStatus(h), /Active deadline: 2026-09-08T00:00:01.000Z/);
+	assert.match(h.notices.at(-1), /Remaining: 0s/);
 
 	h.setIdle(true);
 	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
@@ -281,10 +319,43 @@ test("a due watchdog waits for idle settlement and still delivers at most once",
 	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
 	t.mock.timers.tick(60 * minute);
 	assert.equal(h.sent.length, 1);
+	await assertNoActiveTimeout(h, timers, "settled due operation");
+});
+
+test("a timeout due during compaction delivers once after completion or error", options, async (t) => {
+	const timers = enableTimers(t);
+	for (const outcome of ["complete", "error"]) {
+		const h = makeHarness({ contextTokens: 150_000 });
+		await install(h);
+		await h.commands.get("goal").handler("timeout set 1s", h.ctx);
+		await createGoal(h, `compaction ${outcome}`);
+		h.sent.length = 0;
+		await yieldGoal(h);
+		await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+		assert.equal(h.compactions.length, 1, `${outcome}: compaction started`);
+
+		t.mock.timers.tick(1_000);
+		assert.equal(lastGoal(h).status, "yielded", `${outcome}: due operation waits for compaction`);
+		assert.equal(h.sent.length, 0, `${outcome}: no early delivery`);
+		assert.equal(timers.count(), 0, `${outcome}: fired timer handle consumed`);
+		assert.match(await timeoutStatus(h), /Remaining: 0s/, `${outcome}: due status is clamped`);
+
+		if (outcome === "complete") h.compactions[0].onComplete({});
+		else h.compactions[0].onError(new Error("compaction failed"));
+		assert.equal(lastGoal(h).status, "paused", `${outcome}: timeout pauses after compaction settles`);
+		assert.equal(h.sent.filter(({ message }) => message.details?.kind === "timeout").length, 1, `${outcome}: one timeout delivery`);
+
+		h.compactions[0].onComplete({});
+		h.compactions[0].onError(new Error("late duplicate"));
+		await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
+		t.mock.timers.tick(60 * minute);
+		assert.equal(h.sent.filter(({ message }) => message.details?.kind === "timeout").length, 1, `${outcome}: no duplicate delivery`);
+		await assertNoActiveTimeout(h, timers, `compaction ${outcome}`);
+	}
 });
 
 test("lifecycle boundaries revoke a stale timeout", options, async (t) => {
-	enableTimers(t);
+	const timers = enableTimers(t);
 	for (const transition of ["pause", "clear", "replace", "reload", "tree", "interrupt", "shutdown"]) {
 		const h = makeHarness();
 		await install(h);
@@ -309,11 +380,12 @@ test("lifecycle boundaries revoke a stale timeout", options, async (t) => {
 
 		t.mock.timers.tick(1_000);
 		assert.equal(h.sent.some(({ message }) => message.details?.kind === "timeout"), false, transition);
+		await assertNoActiveTimeout(h, timers, transition);
 	}
 });
 
 test("failed yield persistence and failed timeout persistence publish no timeout follow-up", options, async (t) => {
-	enableTimers(t);
+	const timers = enableTimers(t);
 	const failedYield = makeHarness();
 	await install(failedYield);
 	await createGoal(failedYield);
@@ -322,6 +394,7 @@ test("failed yield persistence and failed timeout persistence publish no timeout
 	failedYield.setAppendThrows(false);
 	t.mock.timers.tick(29 * minute);
 	assert.equal(failedYield.sent.filter(({ message }) => message.details?.kind === "timeout").length, 0);
+	await assertNoActiveTimeout(failedYield, timers, "failed yield persistence");
 
 	const failedTimeout = makeHarness();
 	await install(failedTimeout);
@@ -336,4 +409,5 @@ test("failed yield persistence and failed timeout persistence publish no timeout
 	assert.equal(failedTimeout.sent.length, 0);
 	t.mock.timers.tick(60 * minute);
 	assert.equal(failedTimeout.sent.length, 0);
+	await assertNoActiveTimeout(failedTimeout, timers, "failed timeout persistence");
 });
