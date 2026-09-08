@@ -6,9 +6,6 @@ const { createJiti } = require("jiti");
 
 const globalPi = "/usr/lib/node_modules/@earendil-works/pi-coding-agent";
 const options = existsSync(globalPi) ? {} : { skip: "Pi global runtime is unavailable" };
-const sourceKey = ["expect", "_wake_by"].join("");
-const discardKey = ["discard", "Token"].join("");
-const timeoutKey = ["timeout", "Seconds"].join("");
 
 function makeHarness({ runtimeSupport = false, contextTokens, entries = [], idle = true, pending = false } = {}) {
 	const handlers = new Map();
@@ -169,10 +166,10 @@ test("a yielded goal stays quiet as time passes", options, async (t) => {
 
 test("unsupported yield input is rejected before wait or permission mutation", options, async () => {
 	const cases = [
-		{ params: { reason: "legacy source", [sourceKey]: "event" } },
-		{ params: { reason: "legacy source", [sourceKey]: "rpc" } },
-		{ params: { reason: "legacy timeout", [timeoutKey]: 270 } },
-		{ params: { reason: "legacy rewind", [discardKey]: 3 } },
+		{ params: { reason: "legacy source", expect_wake_by: "event" } },
+		{ params: { reason: "legacy source", expect_wake_by: "rpc" } },
+		{ params: { reason: "legacy timeout", timeoutSeconds: 270 } },
+		{ params: { reason: "legacy rewind", discardToken: 3 } },
 	];
 	for (const current of cases) {
 		const h = makeHarness();
@@ -190,7 +187,7 @@ test("an unsupported rewind-shaped input cannot mutate the goal", options, async
 	const h = makeHarness();
 	await install(h);
 	await createGoal(h);
-	await assert.rejects(yieldGoal(h, "event", "waiting", { [discardKey]: "not-issued" }), /Unsupported yield_goal parameter/);
+	await assert.rejects(yieldGoal(h, "event", "waiting", { discardToken: "not-issued" }), /Unsupported yield_goal parameter/);
 	assert.equal(lastGoal(h).status, "active");
 });
 
@@ -415,4 +412,68 @@ test("a yielded goal restored from an older version is paused without guessing i
 	assert.equal(lastGoal(h).tokensUsed, legacy.tokensUsed);
 	assert.equal(lastGoal(h).waitId, undefined);
 	assert.equal(observations(h).some((entry) => entry.wakeSource === "user" || entry.wakeSource === "event"), false);
+});
+
+test("a valid v4 yielded wait migrates and closes with the same identity", options, async () => {
+	const legacy = {
+		version: 4,
+		id: "legacy-v4-wait",
+		objective: "retain this objective",
+		status: "yielded",
+		tokenBudget: null,
+		tokensUsed: 4,
+		timeUsedSeconds: 5,
+		createdAt: 1,
+		updatedAt: 2,
+		yieldReason: "old wait",
+		yieldedAt: 2,
+		waitId: "wait-v4",
+		waitStartedAt: 2,
+		waitTimeouts: 3,
+	};
+	const h = makeHarness({ entries: [{ id: "legacy-v4", type: "custom", customType: "pi-goal", data: { goal: legacy } }] });
+	await install(h, "startup");
+	const ended = observations(h).find((entry) => entry.kind === "wait_ended");
+	assert.ok(ended);
+	assert.equal(ended.waitId, legacy.waitId);
+	assert.equal(ended.waitStartedAt, legacy.waitStartedAt);
+	assert.equal(ended.wakeSource, "unknown");
+	assert.equal(ended.terminationReason, "session_restore");
+	assert.equal(lastGoal(h).version, 5);
+	assert.equal(lastGoal(h).status, "paused");
+	assert.equal(lastGoal(h).waitId, undefined);
+});
+
+test("malformed v4 wait tuples fail safe through session start", options, async () => {
+	const base = {
+		version: 4,
+		id: "invalid-v4",
+		objective: "must stay stopped",
+		status: "yielded",
+		tokenBudget: null,
+		tokensUsed: 0,
+		timeUsedSeconds: 0,
+		createdAt: 1,
+		updatedAt: 1,
+		yieldReason: "old wait",
+		yieldedAt: 1,
+	};
+	const invalidRecords = [
+		{ ...base, waitId: "wait-v4", waitStartedAt: 1 },
+		{ ...base, waitId: "wait-v4", waitTimeouts: 3 },
+		{ ...base, status: "active", waitStartedAt: 1, waitTimeouts: 3 },
+	];
+	for (const invalid of invalidRecords) {
+		const h = makeHarness({ entries: [{ id: "invalid", type: "custom", customType: "pi-goal", data: { goal: invalid } }] });
+		await install(h, "startup");
+		assert.equal(lastGoal(h), invalid);
+		assert.equal(observations(h).length, 0);
+		assert.equal(h.sent.length, 0);
+		assert.match(h.notices.at(-1), /Goal state ignored safely/);
+		h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+		h.handlers.get("agent_end")({ messages: [] }, h.ctx);
+		await Promise.resolve();
+		assert.equal(lastGoal(h), invalid);
+		assert.equal(h.sent.length, 0);
+	}
 });

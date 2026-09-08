@@ -140,9 +140,7 @@ test("createGoalState creates a deterministic active goal when time and random a
 	});
 });
 
-test("versions one through four migrate to the current wait schema", () => {
-	const sourceKey = ["expect", "WakeBy"].join("");
-	const policyKey = ["wait", "PolicyReason"].join("");
+test("versions one through three migrate their known wait history", () => {
 	for (const version of [1, 2]) {
 		const restored = restoreGoalState({ version, id: "old", objective: "keep going", status: "active", tokenBudget: null, tokensUsed: 2, timeUsedSeconds: 3, createdAt: 4, updatedAt: 5 });
 		assert.equal(restored.migrated, true, `v${version}`);
@@ -152,30 +150,54 @@ test("versions one through four migrate to the current wait schema", () => {
 		assert.equal(restored.goal.timeUsedSeconds, 3, `v${version}`);
 		assert.equal(restored.goal.waitStartedAt, undefined, `v${version}`);
 	}
-	for (const version of [3, 4]) {
-		const restored = restoreGoalState({
-			version, id: `waiting-v${version}`, objective: "await a child", status: "yielded", yieldReason: "child running",
-			yieldedAt: 5_000, tokenBudget: null, tokensUsed: 2, timeUsedSeconds: 3, createdAt: 0, updatedAt: 5_000,
-			waitId: "wait-1", waitStartedAt: 1_000, waitTimeouts: 4,
-			[sourceKey]: "event", [policyKey]: "insufficient_evidence",
-		});
-		assert.equal(restored.migrated, true, `v${version}`);
-		assert.equal(restored.goal.version, 5, `v${version}`);
-		assert.equal(restored.goal.objective, "await a child", `v${version}`);
-		assert.equal(restored.goal.status, "yielded", `v${version}`);
-		assert.equal(restored.goal.tokensUsed, 2, `v${version}`);
-		assert.equal(restored.goal.waitStartedAt, 1_000, `v${version}`);
-		assert.equal(restored.goal.waitTimeouts, 4, `v${version}`);
-		assert.equal(restored.goal.waitId, undefined, `v${version}`);
-		assert.equal(restored.goal[sourceKey], undefined, `v${version}`);
-		assert.equal(restored.goal[policyKey], undefined, `v${version}`);
-	}
+
+	const restored = restoreGoalState({
+		version: 3, id: "waiting-v3", objective: "await a child", status: "yielded", yieldReason: "child running",
+		yieldedAt: 5_000, tokenBudget: null, tokensUsed: 2, timeUsedSeconds: 3, createdAt: 0, updatedAt: 5_000,
+		waitStartedAt: 1_000, waitTimeouts: 4,
+	});
+	assert.equal(restored.migrated, true);
+	assert.equal(restored.goal.version, 5);
+	assert.equal(restored.goal.objective, "await a child");
+	assert.equal(restored.goal.status, "yielded");
+	assert.equal(restored.goal.tokensUsed, 2);
+	assert.equal(restored.goal.waitStartedAt, 1_000);
+	assert.equal(restored.goal.waitTimeouts, 4);
+	assert.equal(restored.goal.waitId, undefined);
 	assert.equal(restoreGoalState({ version: 99 }).goal, null);
-	assert.equal(restoreGoalState({
-		version: 5, id: "bad", objective: "await", status: "yielded", yieldReason: "waiting",
-		tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 0, updatedAt: 1,
-		waitStartedAt: 1,
-	}).goal, null);
+});
+
+test("version four preserves a valid yielded wait tuple during migration", () => {
+	const restored = restoreGoalState({
+		version: 4, id: "waiting-v4", objective: "await a child", status: "yielded", yieldReason: "child running",
+		yieldedAt: 5_000, tokenBudget: null, tokensUsed: 2, timeUsedSeconds: 3, createdAt: 0, updatedAt: 5_000,
+		waitId: "wait-1", waitStartedAt: 1_000, waitTimeouts: 4,
+	});
+	assert.equal(restored.migrated, true);
+	assert.equal(restored.goal.version, 5);
+	assert.equal(restored.goal.objective, "await a child");
+	assert.equal(restored.goal.status, "yielded");
+	assert.equal(restored.goal.waitId, "wait-1");
+	assert.equal(restored.goal.waitStartedAt, 1_000);
+	assert.equal(restored.goal.waitTimeouts, 4);
+});
+
+test("version four rejects partial wait tuples before migration", () => {
+	const base = {
+		version: 4, id: "invalid-v4", objective: "must stay stopped", status: "yielded", yieldReason: "child running",
+		yieldedAt: 5_000, tokenBudget: null, tokensUsed: 2, timeUsedSeconds: 3, createdAt: 0, updatedAt: 5_000,
+	};
+	for (const partial of [
+		{ waitId: "wait-1", waitStartedAt: 1_000 },
+		{ waitId: "wait-1", waitTimeouts: 4 },
+		{ waitStartedAt: 1_000, waitTimeouts: 4 },
+		{ waitId: "wait-1", waitStartedAt: "invalid", waitTimeouts: 4 },
+	]) {
+		const restored = restoreGoalState({ ...base, ...partial });
+		assert.equal(restored.goal, null);
+		assert.match(restored.diagnostic, /malformed observable wait fields/);
+		assert.equal(restored.migrated, false);
+	}
 });
 
 test("a current yielded record restores its wait identity", () => {

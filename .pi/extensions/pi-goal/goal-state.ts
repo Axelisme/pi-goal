@@ -16,8 +16,8 @@ export type GoalState = {
 	yieldReason?: string;
 	yieldedAt?: number;
 	// The current wait sequence starts at the first yield and ends when a real external
-	// event wakes the goal or its lifecycle is terminated. Legacy restored records may
-	// lack identity until a fresh explicit yield starts a new observable wait.
+	// event wakes the goal or its lifecycle is terminated. Older records may lack identity
+	// until a fresh explicit yield starts a new observable wait.
 	waitId?: string;
 	waitStartedAt?: number;
 	waitTimeouts?: number;
@@ -83,17 +83,19 @@ export function restoreGoalState(value: unknown): RestoreGoalResult {
 
 	const hasWaitData = ["waitId", "waitStartedAt", "waitTimeouts"].some((key) => raw[key] !== undefined);
 	const hasWaitStart = finiteNonNegative(raw.waitStartedAt);
-	if (raw.version === GOAL_STATE_VERSION && (base.status === "yielded" || hasWaitData)) {
-		const validWaitCount = raw.waitTimeouts === undefined || Number.isInteger(raw.waitTimeouts) && finiteNonNegative(raw.waitTimeouts);
+	const requiresWaitTuple = (raw.version === 4 || raw.version === GOAL_STATE_VERSION)
+		&& (base.status === "yielded" || hasWaitData);
+	if (requiresWaitTuple) {
+		const validWaitCount = Number.isInteger(raw.waitTimeouts) && finiteNonNegative(raw.waitTimeouts);
 		const validWaitIdentity = typeof raw.waitId === "string" && raw.waitId.length > 0;
 		if (!hasWaitStart || !validWaitCount || !validWaitIdentity) {
 			return { goal: null, diagnostic: "Goal state has malformed observable wait fields.", migrated: false };
 		}
 		base.waitId = raw.waitId;
 		base.waitStartedAt = raw.waitStartedAt;
-		base.waitTimeouts = raw.waitTimeouts === undefined ? 0 : raw.waitTimeouts;
+		base.waitTimeouts = raw.waitTimeouts;
 	} else if (hasWaitStart) {
-		// v1-v4 wait history is retained, but its identity is unknown. A restored
+		// v1-v3 wait history is retained, but its identity is unknown. A restored
 		// yielded record is paused by the runtime before it can acquire authority.
 		base.waitStartedAt = raw.waitStartedAt;
 		base.waitTimeouts = Number.isInteger(raw.waitTimeouts) && finiteNonNegative(raw.waitTimeouts) ? raw.waitTimeouts : 0;
