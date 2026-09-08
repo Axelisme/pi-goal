@@ -1,13 +1,12 @@
+import type { ExpectedWakeBy, WaitPolicyReason } from "./wait-policy";
+
 export type GoalStatus = "active" | "yielded" | "paused" | "budget_limited" | "complete";
 
-export const GOAL_STATE_VERSION = 3 as const;
+export const GOAL_STATE_VERSION = 4 as const;
 export const MAX_YIELD_REASON_LENGTH = 240;
-export const DEFAULT_YIELD_TIMEOUT_SECONDS = 270;
-export const MIN_YIELD_TIMEOUT_SECONDS = 30;
-export const MAX_YIELD_TIMEOUT_SECONDS = 600;
 
 export type GoalState = {
-	version: 3;
+	version: 4;
 	id: string;
 	objective: string;
 	status: GoalStatus;
@@ -18,11 +17,14 @@ export type GoalState = {
 	updatedAt: number;
 	yieldReason?: string;
 	yieldedAt?: number;
-	// The current wait sequence: one uninterrupted stretch of waiting that may span many
-	// fallback timeouts. It starts at the first yield, survives every timeout recheck and
-	// re-yield, and ends when a real external event wakes the goal.
+	// The current wait sequence starts at the first yield and ends when a real external
+	// event wakes the goal or its lifecycle is terminated. Legacy restored records may
+	// lack identity/source until a fresh explicit yield starts a new observable wait.
+	waitId?: string;
 	waitStartedAt?: number;
 	waitTimeouts?: number;
+	expectWakeBy?: ExpectedWakeBy;
+	waitPolicyReason?: WaitPolicyReason;
 };
 
 type LegacyGoalState = Omit<GoalState, "version" | "status" | "waitStartedAt" | "waitTimeouts"> & { version: 1; status: Exclude<GoalStatus, "yielded"> };
@@ -55,7 +57,7 @@ export function migrateGoalState(value: unknown): GoalState | null {
 export function restoreGoalState(value: unknown): RestoreGoalResult {
 	if (!value || typeof value !== "object") return { goal: null, diagnostic: "Goal state is not an object.", migrated: false };
 	const raw = value as Record<string, unknown>;
-	if (raw.version !== 1 && raw.version !== 2 && raw.version !== GOAL_STATE_VERSION) {
+	if (raw.version !== 1 && raw.version !== 2 && raw.version !== 3 && raw.version !== GOAL_STATE_VERSION) {
 		return { goal: null, diagnostic: `Unsupported goal state version: ${String(raw.version)}.`, migrated: false };
 	}
 	if (typeof raw.id !== "string" || !raw.id || typeof raw.objective !== "string" || !raw.objective.trim()) {
@@ -88,6 +90,14 @@ export function restoreGoalState(value: unknown): RestoreGoalResult {
 	if (finiteNonNegative(raw.waitStartedAt)) {
 		base.waitStartedAt = raw.waitStartedAt;
 		base.waitTimeouts = finiteNonNegative(raw.waitTimeouts) ? Math.floor(raw.waitTimeouts) : 0;
+		if (raw.version === GOAL_STATE_VERSION) {
+			if (typeof raw.waitId !== "string" || !raw.waitId || raw.expectWakeBy !== "user" && raw.expectWakeBy !== "event") {
+				return { goal: null, diagnostic: "Goal state has malformed observable wait fields.", migrated: false };
+			}
+			base.waitId = raw.waitId;
+			base.expectWakeBy = raw.expectWakeBy;
+			if (raw.waitPolicyReason === "user_away_prior" || raw.waitPolicyReason === "insufficient_evidence") base.waitPolicyReason = raw.waitPolicyReason;
+		}
 	}
 	return { goal: base, migrated: raw.version !== GOAL_STATE_VERSION };
 }
@@ -116,14 +126,6 @@ export function normalizeTokenBudget(value: unknown): { tokenBudget: number | nu
 		return { tokenBudget: null, error: "tokenBudget must be a positive number when provided." };
 	}
 	return { tokenBudget };
-}
-
-export function normalizeYieldTimeoutSeconds(value: unknown): { timeoutSeconds: number | null; error?: string } {
-	if (value == null) return { timeoutSeconds: DEFAULT_YIELD_TIMEOUT_SECONDS };
-	if (typeof value !== "number" || !Number.isInteger(value) || value < MIN_YIELD_TIMEOUT_SECONDS || value > MAX_YIELD_TIMEOUT_SECONDS) {
-		return { timeoutSeconds: null, error: `timeoutSeconds must be an integer between ${MIN_YIELD_TIMEOUT_SECONDS} and ${MAX_YIELD_TIMEOUT_SECONDS} seconds.` };
-	}
-	return { timeoutSeconds: value };
 }
 
 export function formatTokens(value: number): string {
@@ -190,22 +192,25 @@ export function createGoalState(objective: string, tokenBudget: number | null, n
 	};
 }
 
-export function yieldGoalState(state: GoalState, reason: unknown, now = Date.now()): GoalState | null {
+export function yieldGoalState(state: GoalState, reason: unknown, expectWakeBy: ExpectedWakeBy, waitPolicyReason: WaitPolicyReason, now = Date.now()): GoalState | null {
 	const normalized = normalizeYieldReason(reason);
 	if (state.status !== "active" || !normalized) return null;
-	// Re-yielding inside a wait sequence keeps its start and count; a goal whose sequence was
-	// ended by a real external wake starts a fresh one here.
-	const waitStartedAt = state.waitStartedAt ?? now;
-	const waitTimeouts = state.waitStartedAt == null ? 0 : state.waitTimeouts ?? 0;
-	return { ...state, version: GOAL_STATE_VERSION, status: "yielded", yieldReason: normalized, yieldedAt: now, updatedAt: now, waitStartedAt, waitTimeouts };
+	const sameWait = state.waitStartedAt != null && state.expectWakeBy === expectWakeBy;
+	const waitStartedAt = sameWait ? state.waitStartedAt! : now;
+	const waitTimeouts = sameWait ? state.waitTimeouts ?? 0 : 0;
+	const waitId = sameWait && state.waitId ? state.waitId : `wait-${state.id}-${now}`;
+	return { ...state, version: GOAL_STATE_VERSION, status: "yielded", yieldReason: normalized, yieldedAt: now, updatedAt: now, waitId, waitStartedAt, waitTimeouts, expectWakeBy, waitPolicyReason };
 }
 
 /** End the current wait sequence. A real external wake, not a fallback timeout, is what ends one. */
 export function endWaitSequence(state: GoalState): GoalState {
-	if (state.waitStartedAt == null && state.waitTimeouts == null) return state;
+	if (state.waitStartedAt == null && state.waitTimeouts == null && state.waitId == null && state.expectWakeBy == null) return state;
 	const next = { ...state, version: GOAL_STATE_VERSION };
+	delete next.waitId;
 	delete next.waitStartedAt;
 	delete next.waitTimeouts;
+	delete next.expectWakeBy;
+	delete next.waitPolicyReason;
 	return next;
 }
 

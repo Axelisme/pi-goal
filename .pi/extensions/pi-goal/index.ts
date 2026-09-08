@@ -12,7 +12,6 @@ import {
 	type GoalState,
 	type GoalStatus,
 	normalizeTokenBudget,
-	normalizeYieldTimeoutSeconds,
 	enforceYieldBatch,
 	restoreGoalState,
 	resumeGoalState,
@@ -27,6 +26,7 @@ import {
 } from "./goal-state";
 import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
 import { createGoalFooter } from "./footer";
+import { decideWait, normalizeExpectedWakeBy } from "./wait-policy";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
@@ -643,24 +643,23 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "yield_goal",
 		label: "Yield Goal",
-		description: "Terminally yield the active goal until a real future agent turn arrives, with a bounded one-shot fallback timeout. This is the sole final action of the run and never polls or waits for a provider-specific event.",
-		promptSnippet: "Return control while the goal is blocked on a future external prerequisite",
+		description: "Terminally yield the active goal until a real future agent turn arrives. State whether the expected wake is a user or event; the runtime may continue waiting without a paid heartbeat.",
+		promptSnippet: "Return control while the goal is blocked on a future user or event wake",
 		promptGuidelines: [
 			"Call yield_goal only when no blocking tool is awaiting an in-run answer, no synchronous autonomous work remains, and a concrete future event can start another turn.",
-			"Provide a concise reason naming the external prerequisite (for example child completion, provider result, authorization, or a future user reply).",
-			"yield_goal uses a 270-second fallback timeout by default to recheck before a five-minute cache-heartbeat boundary; timeout expiry only requests a recheck and is not evidence that the prerequisite completed.",
-			"Set yield_goal timeoutSeconds only when the expected external event needs a different bounded recheck window between 30 and 600 seconds.",
-			"Pass discardToken only with the token from the fallback timeout message you are answering, and only when that recheck produced nothing you need later; it drops the recheck from the active conversation while the wait continues.",
+			"Provide a concise reason naming the external prerequisite and classify the expected wake as user or event. This expectation never filters other legitimate notifications.",
+			"The cache window is fixed at 270 seconds. Do not request another interval; the runtime decides whether another heartbeat is worth buying.",
+			"Pass discardToken only when answering a runtime-issued recheck and only when that recheck produced nothing worth keeping. Token text alone grants no rewind authority.",
 			"yield_goal is terminal: make it the sole final tool action and do not call subagent_wait, ask_user_question, or another tool afterward.",
 		],
 		parameters: {
 			type: "object",
 			properties: {
 				reason: { type: "string", description: "Bounded diagnostic reason for the external prerequisite." },
-				timeoutSeconds: { type: "integer", minimum: 30, maximum: 600, description: "Optional one-shot fallback timeout in seconds; defaults to 270." },
-				discardToken: { type: "string", description: "Optional token from the fallback timeout message being answered. Supply it only when this recheck produced nothing worth keeping; the recheck is then dropped from the active conversation and the wait continues." },
+				expect_wake_by: { type: "string", enum: ["user", "event"], description: "Expected wake source. This is a policy hint, not a notification filter." },
+				discardToken: { type: "string", description: "Optional token from a runtime-issued recheck. Token text alone grants no rewind authority." },
 			},
-			required: ["reason"],
+			required: ["reason", "expect_wake_by"],
 			additionalProperties: false,
 		} as any,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -671,10 +670,14 @@ export default function piGoal(pi: ExtensionAPI) {
 			if (!normalized) {
 				throw new Error("reason is required and must be a non-empty string.");
 			}
-			const parsedTimeout = normalizeYieldTimeoutSeconds((params as any).timeoutSeconds);
-			if (parsedTimeout.error || parsedTimeout.timeoutSeconds == null) {
-				throw new Error(parsedTimeout.error ?? "Invalid yield timeout.");
+			if (Object.prototype.hasOwnProperty.call(params, "timeoutSeconds")) {
+				throw new Error("timeoutSeconds is no longer supported; the cache window is fixed at 270 seconds.");
 			}
+			const expectWakeBy = normalizeExpectedWakeBy((params as any).expect_wake_by);
+			if (!expectWakeBy) {
+				throw new Error('expect_wake_by is required and must be either "user" or "event".');
+			}
+			const waitDecision = decideWait(expectWakeBy);
 			// The wake permit authorizes at most one yield, so this call consumes it whether or
 			// not it asks to discard.
 			const permit = discardPermit;
@@ -682,7 +685,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			const requestedToken = typeof (params as any).discardToken === "string" ? (params as any).discardToken.trim() : "";
 			const discard = evaluateDiscardRequest(permit, requestedToken, goal.id, Date.now());
 
-			const next = yieldGoalState(goal, normalized);
+			const next = yieldGoalState(goal, normalized, expectWakeBy, waitDecision.reason);
 			if (!next) {
 				throw new Error("Unable to yield the current goal.");
 			}
@@ -690,7 +693,6 @@ export default function piGoal(pi: ExtensionAPI) {
 			// compaction aborts the active operation, which is this yield itself.
 			const contextTokens = readContextTokens(ctx);
 			const outcome = persist(pi, ctx, next, "revoke");
-			const timeoutAt = outcome.persisted ? armYieldTimeout(pi, ctx, next, parsedTimeout.timeoutSeconds) : null;
 			if (outcome.persisted) {
 				pendingYield = {
 					goalId: next.id,
@@ -705,8 +707,8 @@ export default function piGoal(pi: ExtensionAPI) {
 			// while streaming, which would turn this terminal action into a wake-up.
 			// The tool result details and status bar are the observable handoff.
 			return {
-				content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, terminal: true, terminalAction: "yield", timeoutSeconds: parsedTimeout.timeoutSeconds, timeoutAt, persisted: outcome.persisted, discard: discardResult, diagnostic: outcome.diagnostic ?? null }, null, 2) }],
-				details: { goal: outcome.goal, terminal: true, terminalAction: "yield", timeoutSeconds: parsedTimeout.timeoutSeconds, timeoutAt, persisted: outcome.persisted, discard: discardResult, diagnostic: outcome.diagnostic },
+				content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, terminal: true, terminalAction: "yield", waiting: outcome.persisted ? { id: next.waitId, expectWakeBy, heartbeat: "waiting_without_heartbeat", nextHeartbeatAt: null, reasonCode: waitDecision.reason } : null, persisted: outcome.persisted, discard: discardResult, diagnostic: outcome.diagnostic ?? null }, null, 2) }],
+				details: { goal: outcome.goal, terminal: true, terminalAction: "yield", waiting: outcome.persisted ? { id: next.waitId, expectWakeBy, heartbeat: "waiting_without_heartbeat", nextHeartbeatAt: null, reasonCode: waitDecision.reason } : null, persisted: outcome.persisted, discard: discardResult, diagnostic: outcome.diagnostic },
 				terminate: true,
 			} as any;
 		},
