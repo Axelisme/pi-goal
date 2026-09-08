@@ -48,7 +48,7 @@ The same Pi agent keeps running normal turns in the same session context until i
 - `get_goal` tool: read current goal state
 - `update_goal` tool: model can only mark the goal `complete`
 - `yield_goal({ reason, timeoutSeconds?, discardToken? })` tool: terminally return control while awaiting a future external prerequisite; the reason is normalized and bounded, a one-shot 270-second cache-heartbeat fallback rechecks by default, and `discardToken` discards the recheck that issued it
-- `get_goal`, `update_goal`, and `yield_goal` remain exposed while a goal is `active` or `yielded` so a provider request snapshotted before `turn_start` retains the goal contract; continuation authority is still disabled while yielded, and paused, cleared, complete, and budget-limited goals hide them
+- all four goal tools remain exposed throughout the session so lifecycle changes do not mutate the provider's cached tool schemas; each tool validates the current goal state when called, and invalid `yield_goal` or `update_goal` calls return an error
 - footer status: `Pursuing goal`, `Goal paused`, `Goal achieved`, or `Goal unmet`, shown on its own final footer line
 
 ## Flow

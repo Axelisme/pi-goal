@@ -72,7 +72,8 @@ function flushMicrotasks() {
 	return new Promise((resolvePromise) => setImmediate(resolvePromise));
 }
 
-const stableGoalTools = ["host-tool", "create_goal", "get_goal", "update_goal", "yield_goal"];
+const goalTools = ["create_goal", "get_goal", "update_goal", "yield_goal"];
+const stableGoalTools = ["host-tool", ...goalTools];
 
 test("goal tools stay stable while lifecycle validity is enforced at execution", options, async () => {
 	const h = makeHarness();
@@ -105,6 +106,15 @@ test("goal tools stay stable while lifecycle validity is enforced at execution",
 	const completedAgain = await h.tools.get("update_goal").execute("update", { status: "complete" }, null, null, h.ctx);
 	assert.equal(completedAgain.isError, true);
 	assert.match(completedAgain.content[0].text, /must be active/);
+
+	await h.tools.get("create_goal").execute("create", { objective: "reach the budget", tokenBudget: 1 }, null, null, h.ctx);
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await h.handlers.get("turn_end")({ message: { usage: { totalTokens: 1 } } }, h.ctx);
+	assert.equal(lastGoal(h).status, "budget_limited");
+	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "budget exhaustion must not change Tool schemas");
+	await h.commands.get("goal").handler("clear", h.ctx);
+	assert.equal(lastGoal(h), null);
+	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "clearing a goal must not change Tool schemas");
 });
 
 test("persisted yielded v2 restore pauses safely with its objective and reason, without continuation", options, async () => {
@@ -128,7 +138,7 @@ test("persisted yielded v2 restore pauses safely with its objective and reason, 
 	assert.equal(lastGoal(h).objective, yielded.objective);
 	assert.equal(lastGoal(h).yieldReason, yielded.yieldReason);
 	assert.match(h.notices.at(-1), /Goal paused after reload\/restore/);
-	assert.deepEqual(h.pi.getActiveTools(), ["create_goal"]);
+	assert.deepEqual(h.pi.getActiveTools(), goalTools);
 	assert.equal(h.sent.length, 0, "restore must not publish or queue a continuation");
 	assert.equal(h.handlers.get("agent_end")({}, h.ctx), undefined);
 	await flushMicrotasks();
@@ -169,7 +179,7 @@ test("malformed and invalid yielded v2 records restore fail-safe without acquiri
 		const h = makeHarness({ entries: [{ type: "custom", customType: "pi-goal", data: { goal: invalid } }] });
 		await install(h);
 
-		assert.deepEqual(h.pi.getActiveTools(), ["create_goal"]);
+		assert.deepEqual(h.pi.getActiveTools(), goalTools);
 		assert.equal(lastGoal(h), invalid, "invalid durable witness is not replaced by an autonomous state");
 		assert.equal(h.sent.length, 0);
 		assert.equal(h.handlers.get("agent_end")({}, h.ctx), undefined);
@@ -185,7 +195,6 @@ test("registered goal commands transition a yielded goal with one matching publi
 			command: "resume",
 			status: "active",
 			kind: "resumed",
-			tools: ["create_goal", "get_goal", "update_goal", "yield_goal"],
 			assertGoal(goal) {
 				assert.equal(goal.objective, "command transition objective");
 				assert.equal(goal.yieldReason, "waiting for command", "resume retains the diagnostic reason for the resumed state");
@@ -195,7 +204,6 @@ test("registered goal commands transition a yielded goal with one matching publi
 			command: "pause",
 			status: "paused",
 			kind: "paused",
-			tools: ["create_goal"],
 			assertGoal(goal) {
 				assert.equal(goal.objective, "command transition objective");
 				assert.equal(goal.yieldReason, "waiting for command");
@@ -205,7 +213,6 @@ test("registered goal commands transition a yielded goal with one matching publi
 			command: "clear",
 			status: null,
 			kind: "cleared",
-			tools: ["create_goal"],
 			assertGoal(goal) {
 				assert.equal(goal.objective, "command transition objective");
 				assert.equal(goal.yieldReason, "waiting for command");
@@ -222,7 +229,7 @@ test("registered goal commands transition a yielded goal with one matching publi
 		assert.equal(h.sent[0].message.details.kind, item.kind);
 		assert.equal(h.sent[0].message.details.goal.status, item.status ?? "yielded");
 		item.assertGoal(h.sent[0].message.details.goal);
-		assert.deepEqual(h.pi.getActiveTools(), item.tools);
+		assert.deepEqual(h.pi.getActiveTools(), goalTools);
 		assert.equal(lastGoal(h)?.status ?? null, item.status);
 		if (item.command === "clear") assert.equal(lastGoal(h), null);
 		h.setPending(true);
@@ -332,7 +339,7 @@ test("an aborted agent run pauses an active goal without queuing another continu
 	await flushMicrotasks();
 
 	assert.equal(lastGoal(h).status, "paused");
-	assert.deepEqual(h.pi.getActiveTools(), ["create_goal"]);
+	assert.deepEqual(h.pi.getActiveTools(), goalTools);
 	assert.equal(h.sent.length, 0, "an interruption must not publish or queue a wake-up message");
 	assert.match(h.notices.at(-1), /Goal paused after interruption/);
 });

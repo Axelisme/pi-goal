@@ -101,7 +101,7 @@ test("Pi message_end filters sibling tools before execution and yield terminates
 	assert.match(h.notices.at(-1), /Waiting for: waiting for provider/);
 	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 	await agent.prompt("external event");
-	assert.deepEqual(providerTools.at(-1).filter((name) => ["get_goal", "update_goal", "yield_goal"].includes(name)), ["get_goal", "update_goal", "yield_goal"]);
+	assert.deepEqual(providerTools.at(-1).filter((name) => ["get_goal", "update_goal", "yield_goal"].includes(name)).sort(), ["get_goal", "update_goal", "yield_goal"]);
 	assert.equal(h.handlers.get("agent_end")({}, h.ctx), undefined);
 });
 
@@ -123,7 +123,7 @@ test("reload pauses active goals and failed resume persistence remains yielded",
 	h.setAppendThrows(true);
 	await h.handlers.get("session_start")({ reason: "reload" }, h.ctx);
 	assert.equal(h.notices.some((notice) => String(notice).includes("revoked autonomy in memory")), true);
-	assert.equal(h.pi.getActiveTools().includes("yield_goal"), false);
+	assert.equal(h.pi.getActiveTools().includes("yield_goal"), true, "revocation keeps the Tool Interface stable");
 	h.setAppendThrows(false);
 
 	await h.tools.get("create_goal").execute("create", { objective: "account safely" }, null, null, h.ctx);
@@ -131,7 +131,7 @@ test("reload pauses active goals and failed resume persistence remains yielded",
 	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 	await h.handlers.get("turn_end")({ message: { usage: { totalTokens: 1 } } }, h.ctx);
 	assert.equal(h.entries.at(-1).data.goal.status, "active", "durable witness remains the prior active record");
-	assert.equal(h.pi.getActiveTools().includes("yield_goal"), false, "failed retention hides goal tools");
+	assert.equal(h.pi.getActiveTools().includes("yield_goal"), true, "failed retention keeps Tool schemas stable");
 	const retainedResult = await h.tools.get("get_goal").execute("get", {}, null, null, h.ctx);
 	assert.equal(JSON.parse(retainedResult.content[0].text).goal.status, "paused");
 	assert.equal(JSON.parse(retainedResult.content[0].text).goal.tokensUsed, 1);
