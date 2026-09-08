@@ -171,7 +171,7 @@ test("version four preserves a valid yielded wait tuple during migration", () =>
 	const restored = restoreGoalState({
 		version: 4, id: "waiting-v4", objective: "await a child", status: "yielded", yieldReason: "child running",
 		yieldedAt: 5_000, tokenBudget: null, tokensUsed: 2, timeUsedSeconds: 3, createdAt: 0, updatedAt: 5_000,
-		waitId: "wait-1", waitStartedAt: 1_000, waitTimeouts: 4,
+		waitId: "wait-1", waitStartedAt: 1_000,
 	});
 	assert.equal(restored.migrated, true);
 	assert.equal(restored.goal.version, 5);
@@ -179,7 +179,7 @@ test("version four preserves a valid yielded wait tuple during migration", () =>
 	assert.equal(restored.goal.status, "yielded");
 	assert.equal(restored.goal.waitId, "wait-1");
 	assert.equal(restored.goal.waitStartedAt, 1_000);
-	assert.equal(restored.goal.waitTimeouts, 4);
+	assert.equal(restored.goal.waitTimeouts, 0);
 });
 
 test("version four rejects partial wait tuples before migration", () => {
@@ -188,7 +188,7 @@ test("version four rejects partial wait tuples before migration", () => {
 		yieldedAt: 5_000, tokenBudget: null, tokensUsed: 2, timeUsedSeconds: 3, createdAt: 0, updatedAt: 5_000,
 	};
 	for (const partial of [
-		{ waitId: "wait-1", waitStartedAt: 1_000 },
+		{ waitId: "wait-1", waitStartedAt: 1_000, waitTimeouts: "invalid" },
 		{ waitId: "wait-1", waitTimeouts: 4 },
 		{ waitStartedAt: 1_000, waitTimeouts: 4 },
 		{ waitId: "wait-1", waitStartedAt: "invalid", waitTimeouts: 4 },

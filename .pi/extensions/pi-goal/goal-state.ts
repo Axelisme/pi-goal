@@ -86,14 +86,16 @@ export function restoreGoalState(value: unknown): RestoreGoalResult {
 	const requiresWaitTuple = (raw.version === 4 || raw.version === GOAL_STATE_VERSION)
 		&& (base.status === "yielded" || hasWaitData);
 	if (requiresWaitTuple) {
-		const validWaitCount = Number.isInteger(raw.waitTimeouts) && finiteNonNegative(raw.waitTimeouts);
+		// v4 may predate the durable wait counter; an omitted count means no
+		// historical timeout has been recorded, not a malformed identity tuple.
+		const validWaitCount = raw.waitTimeouts === undefined || Number.isInteger(raw.waitTimeouts) && finiteNonNegative(raw.waitTimeouts);
 		const validWaitIdentity = typeof raw.waitId === "string" && raw.waitId.length > 0;
 		if (!hasWaitStart || !validWaitCount || !validWaitIdentity) {
 			return { goal: null, diagnostic: "Goal state has malformed observable wait fields.", migrated: false };
 		}
 		base.waitId = raw.waitId;
 		base.waitStartedAt = raw.waitStartedAt;
-		base.waitTimeouts = raw.waitTimeouts;
+		base.waitTimeouts = raw.waitTimeouts === undefined ? 0 : raw.waitTimeouts;
 	} else if (hasWaitStart) {
 		// v1-v3 wait history is retained, but its identity is unknown. A restored
 		// yielded record is paused by the runtime before it can acquire authority.

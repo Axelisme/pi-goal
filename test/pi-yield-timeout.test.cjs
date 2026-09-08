@@ -429,7 +429,6 @@ test("a valid v4 yielded wait migrates and closes with the same identity", optio
 		yieldedAt: 2,
 		waitId: "wait-v4",
 		waitStartedAt: 2,
-		waitTimeouts: 3,
 	};
 	const h = makeHarness({ entries: [{ id: "legacy-v4", type: "custom", customType: "pi-goal", data: { goal: legacy } }] });
 	await install(h, "startup");
@@ -459,7 +458,7 @@ test("malformed v4 wait tuples fail safe through session start", options, async 
 		yieldedAt: 1,
 	};
 	const invalidRecords = [
-		{ ...base, waitId: "wait-v4", waitStartedAt: 1 },
+		{ ...base, waitId: "wait-v4", waitStartedAt: 1, waitTimeouts: "invalid" },
 		{ ...base, waitId: "wait-v4", waitTimeouts: 3 },
 		{ ...base, status: "active", waitStartedAt: 1, waitTimeouts: 3 },
 	];
