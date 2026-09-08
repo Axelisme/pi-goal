@@ -60,10 +60,12 @@ let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
 let pendingYield: PendingYield | null = null;
 let compactionActive = false;
-// Input source is only a candidate until Pi accepts the prompt through its input
-// pipeline. A handled input never reaches before_agent_start, so it cannot arm a
-// later unrelated native wake with stale provenance.
-let pendingInputWakeSource: WakeSource | null = null;
+// Pi exposes input source and prompt acceptance through separate, unkeyed callbacks.
+// Keep only a bounded candidate summary: any overlapping or still-unresolved candidate
+// makes the eventual wake unknown rather than guessing which prompt was accepted.
+let pendingInputWakeSourceCandidate: WakeSource | null = null;
+let pendingInputCandidateCount = 0;
+let pendingInputWakeAmbiguous = false;
 let pendingWakeSource: WakeSource | null = null;
 let mintCounter = 0;
 
@@ -73,7 +75,9 @@ function mint(prefix: string): string {
 }
 
 function clearPendingWakeSource() {
-	pendingInputWakeSource = null;
+	pendingInputWakeSourceCandidate = null;
+	pendingInputCandidateCount = 0;
+	pendingInputWakeAmbiguous = false;
 	pendingWakeSource = null;
 }
 
@@ -870,28 +874,36 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("input", (event) => {
 		// Input is only a provenance candidate. Pi may let a later input handler
-		// consume it, in which case no turn_start follows this event.
+		// consume it, in which case no before_agent_start or turn_start follows.
 		if (goal?.status !== "yielded") {
 			clearPendingWakeSource();
 			return;
 		}
-		// A newer input must prove its own acceptance; it cannot inherit a
-		// previously confirmed source while its handlers are still running.
-		// Each input is a separate prompt candidate, so a handled candidate must
-		// not poison provenance for the next input that Pi accepts.
-		pendingWakeSource = null;
-		pendingInputWakeSource = classifyInputSource((event as any).source);
+		// Acceptance has no candidate id. A second candidate, including one still
+		// unresolved because another handler may consume it, invalidates attribution
+		// through the entire wake/turn boundary.
+		if (pendingInputCandidateCount > 0 || pendingWakeSource !== null || pendingInputWakeAmbiguous) {
+			pendingInputWakeAmbiguous = true;
+			pendingInputWakeSourceCandidate = null;
+		}
+		pendingInputCandidateCount += 1;
+		if (pendingInputCandidateCount === 1 && !pendingInputWakeAmbiguous) {
+			pendingInputWakeSourceCandidate = classifyInputSource((event as any).source);
+		}
 	});
 
 	pi.on("before_agent_start", () => {
-		// This event is emitted only after Pi's input pipeline accepts the prompt.
-		// Custom-message turns skip it and are deliberately attributed as unknown.
+		// This event is emitted only after Pi's input pipeline accepts a prompt, but
+		// it is not keyed to the input event. Custom-message turns skip it and are
+		// deliberately attributed as unknown.
 		if (goal?.status !== "yielded") {
 			clearPendingWakeSource();
 			return;
 		}
-		pendingWakeSource = pendingInputWakeSource ?? "unknown";
-		pendingInputWakeSource = null;
+		const unambiguousCandidate = pendingInputCandidateCount === 1 && !pendingInputWakeAmbiguous;
+		pendingWakeSource = unambiguousCandidate ? pendingInputWakeSourceCandidate ?? "unknown" : "unknown";
+		pendingInputWakeSourceCandidate = null;
+		pendingInputCandidateCount = 0;
 	});
 
 	pi.on("session_before_tree", () => {
@@ -931,10 +943,10 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		activeTurnStartedAt = Date.now();
 		if (goal?.status === "yielded") {
-			// Only an input confirmed by before_agent_start can carry its source into
-			// this turn. Unconfirmed candidates are discarded as unrelated/unknown.
+			// Only one candidate confirmed by before_agent_start can carry its source
+			// into this turn. Any overlap or unresolved candidate stays unknown.
 			const previous = goal;
-			const wakeSource = pendingWakeSource ?? "unknown";
+			const wakeSource = pendingInputWakeAmbiguous ? "unknown" : pendingWakeSource ?? "unknown";
 			clearPendingWakeSource();
 			const resumed = resumeGoalState(endWaitSequence(goal));
 			if (resumed) {

@@ -261,7 +261,7 @@ test("a handled interactive input cannot label an unrelated native wake", option
 	assert.equal(observations(h).at(-1).wakeSource, "unknown");
 });
 
-test("a handled non-interactive input cannot poison a later accepted interactive wake", options, async () => {
+test("a handled non-interactive input leaves a later accepted interactive wake ambiguous", options, async () => {
 	const h = makeHarness();
 	await install(h);
 	await createGoal(h);
@@ -278,7 +278,32 @@ test("a handled non-interactive input cannot poison a later accepted interactive
 
 	await acceptedInput(h, "interactive");
 	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
-	assert.equal(observations(h).at(-1).wakeSource, "user");
+	assert.equal(observations(h).at(-1).wakeSource, "unknown");
+});
+
+test("overlapping input candidates cannot label an extension wake as user", options, async () => {
+	const h = makeHarness();
+	await install(h);
+	await createGoal(h);
+	await yieldGoal(h, "event", "waiting for overlapping prompts");
+
+	// dispatchInput enters its input handler before awaiting the rest of the
+	// preflight. Starting both operations without awaiting either creates two
+	// candidates; the extension-origin prompt reaches acceptance after the
+	// interactive candidate has entered, without a correlation key.
+	const extensionPreflight = h.dispatchInput({ type: "input", source: "extension", text: "extension prompt" });
+	const interactivePreflight = h.dispatchInput({ type: "input", source: "interactive", text: "interactive prompt" });
+	await h.handlers.get("before_agent_start")({
+		type: "before_agent_start",
+		prompt: "extension prompt",
+		systemPrompt: "",
+		systemPromptOptions: {},
+	}, h.ctx);
+	assert.equal((await extensionPreflight).action, "continue");
+	assert.equal((await interactivePreflight).action, "continue");
+
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	assert.equal(observations(h).at(-1).wakeSource, "unknown");
 });
 
 test("/goal status reports the expected source and quiet heartbeat state", options, async () => {
