@@ -127,8 +127,8 @@ async function createGoal(h, objective = "await a child") {
 	return h.tools.get("create_goal").execute("create", { objective }, null, null, h.ctx);
 }
 
-async function yieldGoal(h, expectWakeBy = "event", reason = "child running", extra = {}) {
-	return h.tools.get("yield_goal").execute("yield", { reason, expect_wake_by: expectWakeBy, ...extra }, null, null, h.ctx);
+async function yieldGoal(h, _ignoredSource = "event", reason = "child running", extra = {}) {
+	return h.tools.get("yield_goal").execute("yield", { reason, ...extra }, null, null, h.ctx);
 }
 
 async function acceptedInput(h, source, text = "wake") {
@@ -147,7 +147,7 @@ async function waitForSettlement(h) {
 	await Promise.resolve();
 }
 
-test("a yielded goal stays quiet across multiple approved cache windows", options, async (t) => {
+test("a yielded goal stays quiet as time passes", options, async (t) => {
 	t.mock.timers.enable({ apis: ["Date"] });
 	const h = makeHarness();
 	await install(h);
@@ -157,45 +157,38 @@ test("a yielded goal stays quiet across multiple approved cache windows", option
 	assert.equal(result.terminate, true);
 	assert.equal(lastGoal(h).status, "yielded");
 	assert.equal(h.sent.length, 0);
-	// Advancing two approved windows still has no runtime operation or synthetic
-	// request in this tracer.
-	t.mock.timers.tick(270_000);
-	t.mock.timers.tick(270_000);
+	// Advancing time still has no runtime operation or synthetic request.
+	t.mock.timers.tick(1_000);
+	t.mock.timers.tick(1_000);
 	assert.equal(h.sent.length, 0, "no fallback or diagnostic timer may manufacture a request");
 	assert.equal(lastGoal(h).status, "yielded");
 });
 
-test("invalid yield input is rejected before wait or permission mutation", options, async () => {
+test("unsupported yield input is rejected before wait or permission mutation", options, async () => {
 	const cases = [
-		{ params: { reason: "missing source" }, error: /expect_wake_by is required/ },
-		{ params: { reason: "bad source", expect_wake_by: "rpc" }, error: /expect_wake_by is required/ },
-		{ params: { reason: "legacy timeout", expect_wake_by: "event", timeoutSeconds: 270 }, error: /timeoutSeconds is no longer supported/ },
-		{ params: { reason: "bad token", expect_wake_by: "event", discardToken: 3 }, error: /discardToken must be/ },
+		{ params: { reason: "legacy source", expect_wake_by: "event" } },
+		{ params: { reason: "legacy source", expect_wake_by: "rpc" } },
+		{ params: { reason: "legacy timeout", timeoutSeconds: 270 } },
+		{ params: { reason: "legacy rewind", discardToken: 3 } },
 	];
 	for (const current of cases) {
 		const h = makeHarness();
 		await install(h);
 		await createGoal(h);
 		const beforeEntries = h.entries.length;
-		await assert.rejects(h.tools.get("yield_goal").execute("yield", current.params, null, null, h.ctx), current.error);
-		assert.equal(lastGoal(h).status, "active", current.error);
+		await assert.rejects(h.tools.get("yield_goal").execute("yield", current.params, null, null, h.ctx), /Unsupported yield_goal parameter/);
+		assert.equal(lastGoal(h).status, "active");
 		assert.equal(h.entries.length, beforeEntries, "invalid input has no durable or observation side effect");
 		assert.equal(h.sent.length, 1, "only create_goal's active marker exists");
 	}
 });
 
-test("a valid discardToken-shaped input cannot create rewind authority without a runtime recheck", options, async () => {
+test("an unsupported rewind-shaped input cannot mutate the goal", options, async () => {
 	const h = makeHarness();
 	await install(h);
 	await createGoal(h);
-	const result = await yieldGoal(h, "event", "waiting", { discardToken: "not-issued" });
-	const payload = JSON.parse(result.content[0].text);
-	assert.deepEqual(payload.discard, {
-		requested: true,
-		accepted: false,
-		reason: "no fallback timeout wake is open for this goal",
-	});
-	assert.equal(lastGoal(h).status, "yielded");
+	await assert.rejects(yieldGoal(h, "event", "waiting", { discardToken: "not-issued" }), /Unsupported yield_goal parameter/);
+	assert.equal(lastGoal(h).status, "active");
 });
 
 test("wait observations are paired, bounded, and excluded from the provider conversation", options, async () => {
@@ -204,9 +197,8 @@ test("wait observations are paired, bounded, and excluded from the provider conv
 	await createGoal(h, "objective must not enter observation");
 	await yieldGoal(h, "event", "reason must not enter observation");
 	const started = observations(h);
-	assert.deepEqual(started.map((entry) => entry.kind), ["wait_started", "policy_decision"]);
+	assert.deepEqual(started.map((entry) => entry.kind), ["wait_started"]);
 	assert.equal(started[0].waitId, lastGoal(h).waitId);
-	assert.equal(started[1].reasonCode, "insufficient_evidence");
 	for (const entry of started) {
 		assert.equal("objective" in entry, false);
 		assert.equal("reason" in entry, false);
@@ -306,14 +298,13 @@ test("overlapping input candidates cannot label an extension wake as user", opti
 	assert.equal(observations(h).at(-1).wakeSource, "unknown");
 });
 
-test("/goal status reports the expected source and quiet heartbeat state", options, async () => {
+test("/goal status reports the waiting reason and identity", options, async () => {
 	const h = makeHarness();
 	await install(h);
 	await createGoal(h);
 	await yieldGoal(h, "user", "waiting for approval");
 	await h.commands.get("goal").handler("status", h.ctx);
-	assert.match(h.notices.at(-1), /Expected wake: user/);
-	assert.match(h.notices.at(-1), /Heartbeat: waiting without heartbeat/);
+	assert.match(h.notices.at(-1), /Waiting for: waiting for approval/);
 	assert.match(h.notices.at(-1), /Wait id:/);
 });
 
@@ -330,7 +321,7 @@ test("native wake ends the wait before provider work without adding a resume mar
 	assert.equal(observations(h).filter((entry) => entry.kind === "wait_ended").length, 1);
 });
 
-test("yield settlement keeps native compaction ordering and never adds a heartbeat", options, async () => {
+test("yield settlement keeps native compaction ordering without a synthetic wake", options, async () => {
 	const h = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
 	await install(h);
 	await createGoal(h);
@@ -419,6 +410,69 @@ test("a yielded goal restored from an older version is paused without guessing i
 	assert.equal(lastGoal(h).status, "paused");
 	assert.equal(lastGoal(h).objective, legacy.objective);
 	assert.equal(lastGoal(h).tokensUsed, legacy.tokensUsed);
-	assert.equal(lastGoal(h).expectWakeBy, undefined);
+	assert.equal(lastGoal(h).waitId, undefined);
 	assert.equal(observations(h).some((entry) => entry.wakeSource === "user" || entry.wakeSource === "event"), false);
+});
+
+test("a valid v4 yielded wait migrates and closes with the same identity", options, async () => {
+	const legacy = {
+		version: 4,
+		id: "legacy-v4-wait",
+		objective: "retain this objective",
+		status: "yielded",
+		tokenBudget: null,
+		tokensUsed: 4,
+		timeUsedSeconds: 5,
+		createdAt: 1,
+		updatedAt: 2,
+		yieldReason: "old wait",
+		yieldedAt: 2,
+		waitId: "wait-v4",
+		waitStartedAt: 2,
+	};
+	const h = makeHarness({ entries: [{ id: "legacy-v4", type: "custom", customType: "pi-goal", data: { goal: legacy } }] });
+	await install(h, "startup");
+	const ended = observations(h).find((entry) => entry.kind === "wait_ended");
+	assert.ok(ended);
+	assert.equal(ended.waitId, legacy.waitId);
+	assert.equal(ended.waitStartedAt, legacy.waitStartedAt);
+	assert.equal(ended.wakeSource, "unknown");
+	assert.equal(ended.terminationReason, "session_restore");
+	assert.equal(lastGoal(h).version, 5);
+	assert.equal(lastGoal(h).status, "paused");
+	assert.equal(lastGoal(h).waitId, undefined);
+});
+
+test("malformed v4 wait tuples fail safe through session start", options, async () => {
+	const base = {
+		version: 4,
+		id: "invalid-v4",
+		objective: "must stay stopped",
+		status: "yielded",
+		tokenBudget: null,
+		tokensUsed: 0,
+		timeUsedSeconds: 0,
+		createdAt: 1,
+		updatedAt: 1,
+		yieldReason: "old wait",
+		yieldedAt: 1,
+	};
+	const invalidRecords = [
+		{ ...base, waitId: "wait-v4", waitStartedAt: 1, waitTimeouts: "invalid" },
+		{ ...base, waitId: "wait-v4", waitTimeouts: 3 },
+		{ ...base, status: "active", waitStartedAt: 1, waitTimeouts: 3 },
+	];
+	for (const invalid of invalidRecords) {
+		const h = makeHarness({ entries: [{ id: "invalid", type: "custom", customType: "pi-goal", data: { goal: invalid } }] });
+		await install(h, "startup");
+		assert.equal(lastGoal(h), invalid);
+		assert.equal(observations(h).length, 0);
+		assert.equal(h.sent.length, 0);
+		assert.match(h.notices.at(-1), /Goal state ignored safely/);
+		h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+		h.handlers.get("agent_end")({ messages: [] }, h.ctx);
+		await Promise.resolve();
+		assert.equal(lastGoal(h), invalid);
+		assert.equal(h.sent.length, 0);
+	}
 });

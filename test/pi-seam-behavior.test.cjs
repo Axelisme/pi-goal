@@ -98,7 +98,7 @@ test("Pi message_end filters sibling tools before execution and yield terminates
 	const agentTools = new Map([...h.tools.values()].map((definition) => [definition.name, { ...definition, execute: (id, params, signal, onUpdate) => definition.execute(id, params, signal, onUpdate, h.ctx) }]));
 	const agent = new Agent({ initialState: { systemPrompt: "goal prompt", model, thinkingLevel: "off", tools: [...agentTools.values()] }, convertToLlm: (messages) => messages, streamFn });
 	h.attachAgent(agent, agentTools);
-	const result = await h.tools.get("yield_goal").execute("yield", { reason: "waiting for provider", expect_wake_by: "event" }, null, null, h.ctx);
+	const result = await h.tools.get("yield_goal").execute("yield", { reason: "waiting for provider" }, null, null, h.ctx);
 	assert.equal(result.terminate, true);
 	assert.equal(result.isTerminal, undefined);
 	assert.equal(h.sent.length, 0, "yield must not queue its own marker while streaming");
@@ -146,10 +146,10 @@ test("reload pauses active goals and failed resume persistence remains yielded",
 	assert.equal(h.handlers.get("agent_end")({}, h.ctx), undefined);
 	h.setAppendThrows(false);
 
-	await h.tools.get("yield_goal").execute("yield", { reason: "external event", expect_wake_by: "event" }, null, null, h.ctx).catch(() => {});
+	await h.tools.get("yield_goal").execute("yield", { reason: "external event" }).catch(() => {});
 	// The paused goal cannot yield; establish a yielded record through a fresh goal.
 	await h.tools.get("create_goal").execute("create", { objective: "resume transaction" }, null, null, h.ctx);
-	await h.tools.get("yield_goal").execute("yield", { reason: "external event", expect_wake_by: "event" }, null, null, h.ctx);
+	await h.tools.get("yield_goal").execute("yield", { reason: "external event" }, null, null, h.ctx);
 	h.setAppendThrows(true);
 	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 	assert.equal(lastGoal(h).status, "yielded", "failed resume keeps the durable witness yielded");
