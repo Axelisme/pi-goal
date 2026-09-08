@@ -164,10 +164,8 @@ async function startWait(h, { objective = "await a child", timeoutSeconds = 30 }
 	await h.flush();
 }
 
-async function startAgent(h, prompt = "external event") {
-	const injected = await h.handlers.get("before_agent_start")({ type: "before_agent_start", prompt }, h.ctx);
+async function startAgent(h) {
 	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
-	return injected;
 }
 
 // Deliver one fallback wake and enter the recheck turn it starts.
