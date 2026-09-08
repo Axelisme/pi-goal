@@ -583,7 +583,8 @@ test("a native turn before the deadline cancels the fallback wake-up", options, 
 	await h.tools.get("yield_goal").execute("yield", { reason: "waiting for completion", timeoutSeconds: 30 }, null, null, h.ctx);
 	h.sent.length = 0;
 
-	await startAgent(h, "native turn");
+	h.handlers.get("input")({ type: "input", text: "native turn", source: "interactive" }, h.ctx);
+	await startAgent(h);
 	assert.equal(lastGoal(h).status, "active");
 	t.mock.timers.runAll();
 	assert.equal(h.sent.length, 0);
