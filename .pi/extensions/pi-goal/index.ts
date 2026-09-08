@@ -202,18 +202,13 @@ function updateStatusBar(ctx: ExtensionContext) {
 	}
 }
 
-const ACTIVE_GOAL_TOOL_NAMES = ["get_goal", "update_goal", "yield_goal"];
+const GOAL_TOOL_NAMES = ["create_goal", "get_goal", "update_goal", "yield_goal"];
 
-// Expose read/update tools to the LLM only while a goal is actively being pursued.
-// Keep create_goal available so the model can set or replace a goal when explicitly asked.
-function syncGoalTools(pi: ExtensionAPI) {
-	// Keep the goal contract in every yielded turn's provider snapshot. The
-	// resumed request may be snapshotted before turn_start; continuation remains
-	// disabled by status, while these tools remain available to that first request.
-	const wantActiveTools = goal?.status === "active" || goal?.status === "yielded";
+// Tool schemas are part of the provider's cached request prefix. Activate the
+// complete Interface once per session and let each execute handler enforce validity.
+function activateGoalTools(pi: ExtensionAPI) {
 	const active = new Set(pi.getActiveTools());
-	active.add("create_goal");
-	for (const name of ACTIVE_GOAL_TOOL_NAMES) (wantActiveTools ? active.add(name) : active.delete(name));
+	for (const name of GOAL_TOOL_NAMES) active.add(name);
 	pi.setActiveTools(Array.from(active));
 }
 
@@ -264,7 +259,6 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 		if (goal?.status !== "yielded") clearYieldTimeout();
 		syncDiscardState(previous, goal);
 		updateStatusBar(ctx);
-		syncGoalTools(pi);
 		return {
 			persisted: false,
 			goal,
@@ -280,7 +274,6 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 	if (next?.status !== "yielded") clearYieldTimeout();
 	syncDiscardState(previous, next);
 	updateStatusBar(ctx);
-	syncGoalTools(pi);
 	return { persisted: true, goal: next, classification: effectiveClass, mode: "committed" };
 }
 
@@ -859,8 +852,8 @@ export default function piGoal(pi: ExtensionAPI) {
 		continuationQueued = false;
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
-		// Keep create_goal available, and hide read/update tools unless there is an active goal to pursue.
-		syncGoalTools(pi);
+		// Activate the complete, stable goal Tool Interface before any provider work.
+		activateGoalTools(pi);
 		if (restored.diagnostic) {
 			// Unknown or malformed records are deliberately non-autonomous.
 			ctx.ui.notify(`Goal state ignored safely: ${restored.diagnostic}`, "warning");
@@ -950,7 +943,6 @@ export default function piGoal(pi: ExtensionAPI) {
 			return;
 		}
 		updateStatusBar(ctx);
-		syncGoalTools(pi);
 	});
 
 	pi.on("turn_start", (_event, ctx) => {
