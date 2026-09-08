@@ -60,6 +60,10 @@ let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
 let pendingYield: PendingYield | null = null;
 let compactionActive = false;
+// Input source is only a candidate until Pi accepts the prompt through its input
+// pipeline. A handled input never reaches before_agent_start, so it cannot arm a
+// later unrelated native wake with stale provenance.
+let pendingInputWakeSource: WakeSource | null = null;
 let pendingWakeSource: WakeSource | null = null;
 let mintCounter = 0;
 
@@ -68,9 +72,14 @@ function mint(prefix: string): string {
 	return `${prefix}-${mintCounter}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function clearPendingWakeSource() {
+	pendingInputWakeSource = null;
+	pendingWakeSource = null;
+}
+
 function clearPendingWaitWork() {
 	pendingYield = null;
-	pendingWakeSource = null;
+	clearPendingWakeSource();
 }
 
 // A session boundary disowns an in-flight compaction request: its callbacks belong to a
@@ -563,6 +572,7 @@ export default function piGoal(pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: parsedBudget.error }], isError: true };
 			}
 			const previous = goal;
+			clearPendingWakeSource();
 			const next = createGoalState(objective, parsedBudget.tokenBudget);
 			const outcome = persist(pi, ctx, next, goal ? "retain" : "acquire");
 			if (!outcome.persisted) throw new Error(outcome.diagnostic ?? "Goal persistence failed.");
@@ -741,7 +751,7 @@ export default function piGoal(pi: ExtensionAPI) {
 					return;
 				}
 				const previous = goal;
-				pendingWakeSource = null;
+				clearPendingWakeSource();
 				const outcome = persist(pi, ctx, null, "revoke");
 				if (reportPersistenceFailure(ctx, "Goal clear is stopped in memory but nondurable", outcome)) return;
 				recordWaitEndAfterPersist(pi, ctx, previous, outcome, "cleared");
@@ -756,7 +766,7 @@ export default function piGoal(pi: ExtensionAPI) {
 				}
 				const status: GoalStatus = trimmed === "pause" ? "paused" : "active";
 				const previous = goal;
-				pendingWakeSource = null;
+				clearPendingWakeSource();
 				const next = { ...endWaitSequence(goal), status, updatedAt: now };
 				const outcome = persist(pi, ctx, next, status === "paused" ? "revoke" : "acquire");
 				if (reportPersistenceFailure(ctx, `Goal ${trimmed} was not persisted`, outcome)) return;
@@ -780,7 +790,7 @@ export default function piGoal(pi: ExtensionAPI) {
 				if (!ok) return;
 			}
 			const previous = goal;
-			pendingWakeSource = null;
+			clearPendingWakeSource();
 			const next = createGoalState(parsed.objective, parsed.tokenBudget, now);
 			const outcome = persist(pi, ctx, next, goal ? "retain" : "acquire");
 			if (reportPersistenceFailure(ctx, "Goal replacement rolled back", outcome)) return;
@@ -859,15 +869,29 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.on("input", (event) => {
-		// Input is observed before prompt preflight. Only interactive input proves a
-		// human wake; RPC and extension input remain unknown until the native turn.
+		// Input is only a provenance candidate. Pi may let a later input handler
+		// consume it, in which case no turn_start follows this event.
 		if (goal?.status !== "yielded") {
-			pendingWakeSource = null;
+			clearPendingWakeSource();
 			return;
 		}
+		// A newer input must prove its own acceptance; it cannot inherit a
+		// previously confirmed source while its handlers are still running.
+		pendingWakeSource = null;
 		const candidate = classifyInputSource((event as any).source);
-		if (pendingWakeSource == null) pendingWakeSource = candidate;
-		else if (pendingWakeSource !== candidate) pendingWakeSource = "unknown";
+		if (pendingInputWakeSource == null) pendingInputWakeSource = candidate;
+		else if (pendingInputWakeSource !== candidate) pendingInputWakeSource = "unknown";
+	});
+
+	pi.on("before_agent_start", () => {
+		// This event is emitted only after Pi's input pipeline accepts the prompt.
+		// Custom-message turns skip it and are deliberately attributed as unknown.
+		if (goal?.status !== "yielded") {
+			clearPendingWakeSource();
+			return;
+		}
+		pendingWakeSource = pendingInputWakeSource ?? "unknown";
+		pendingInputWakeSource = null;
 	});
 
 	pi.on("session_before_tree", () => {
@@ -907,11 +931,11 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		activeTurnStartedAt = Date.now();
 		if (goal?.status === "yielded") {
-			// The native input that caused this turn is already persistent and remains the
-			// sole wake marker. No synthetic resume message is added here.
+			// Only an input confirmed by before_agent_start can carry its source into
+			// this turn. Unconfirmed candidates are discarded as unrelated/unknown.
 			const previous = goal;
 			const wakeSource = pendingWakeSource ?? "unknown";
-			pendingWakeSource = null;
+			clearPendingWakeSource();
 			const resumed = resumeGoalState(endWaitSequence(goal));
 			if (resumed) {
 				const outcome = persist(pi, ctx, resumed, "acquire");
@@ -922,7 +946,7 @@ export default function piGoal(pi: ExtensionAPI) {
 				}
 			}
 		} else {
-			pendingWakeSource = null;
+			clearPendingWakeSource();
 		}
 		activeGoalThisTurnId = goal?.status === "active" ? goal.id : null;
 	});

@@ -9,6 +9,7 @@ const options = existsSync(globalPi) ? {} : { skip: "Pi global runtime is unavai
 
 function makeHarness({ runtimeSupport = false, contextTokens, entries = [], idle = true, pending = false } = {}) {
 	const handlers = new Map();
+	const inputHandlers = [];
 	const tools = new Map();
 	const commands = new Map();
 	const sent = [];
@@ -37,7 +38,10 @@ function makeHarness({ runtimeSupport = false, contextTokens, entries = [], idle
 	}
 
 	const pi = {
-		on(name, handler) { handlers.set(name, handler); },
+		on(name, handler) {
+			if (name === "input") inputHandlers.push(handler);
+			handlers.set(name, handler);
+		},
 		registerTool(tool) { tools.set(tool.name, tool); },
 		registerCommand(name, command) { commands.set(name, command); },
 		registerMessageRenderer() {},
@@ -76,6 +80,14 @@ function makeHarness({ runtimeSupport = false, contextTokens, entries = [], idle
 	return {
 		pi, ctx, handlers, tools, commands, entries, sent, notices, compactions,
 		branchEntries: () => branch(),
+		addInputHandler(handler) { inputHandlers.push(handler); },
+		async dispatchInput(event) {
+			for (const handler of inputHandlers) {
+				const result = await handler(event, ctx);
+				if (result?.action === "handled") return result;
+			}
+			return { action: "continue" };
+		},
 		setAppendThrows(value) { appendThrows = value; },
 		setCompactThrows(value) { compactThrows = value; },
 		setContextTokens(value) { tokens = value; },
@@ -117,6 +129,17 @@ async function createGoal(h, objective = "await a child") {
 
 async function yieldGoal(h, expectWakeBy = "event", reason = "child running", extra = {}) {
 	return h.tools.get("yield_goal").execute("yield", { reason, expect_wake_by: expectWakeBy, ...extra }, null, null, h.ctx);
+}
+
+async function acceptedInput(h, source, text = "wake") {
+	const result = await h.dispatchInput({ type: "input", source, text });
+	assert.equal(result.action, "continue");
+	await h.handlers.get("before_agent_start")({
+		type: "before_agent_start",
+		prompt: text,
+		systemPrompt: "",
+		systemPromptOptions: {},
+	}, h.ctx);
 }
 
 async function waitForSettlement(h) {
@@ -207,7 +230,7 @@ test("only interactive input is labelled as a user wake", options, async () => {
 		await install(h);
 		await createGoal(h);
 		await yieldGoal(h, "user", "waiting for a person");
-		if (source) h.handlers.get("input")({ type: "input", source, text: "wake" }, h.ctx);
+		await acceptedInput(h, source);
 		await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 		assert.equal(observations(h).at(-1).wakeSource, "unknown", source ?? "missing source");
 	}
@@ -215,9 +238,27 @@ test("only interactive input is labelled as a user wake", options, async () => {
 	await install(interactive);
 	await createGoal(interactive);
 	await yieldGoal(interactive, "event");
-	interactive.handlers.get("input")({ type: "input", source: "interactive", text: "wake" }, interactive.ctx);
+	await acceptedInput(interactive, "interactive");
 	await interactive.handlers.get("turn_start")({ type: "turn_start" }, interactive.ctx);
 	assert.equal(observations(interactive).at(-1).wakeSource, "user");
+});
+
+test("a handled interactive input cannot label an unrelated native wake", options, async () => {
+	const h = makeHarness();
+	await install(h);
+	await createGoal(h);
+	await yieldGoal(h, "event", "waiting for a handled prompt");
+
+	// A later input handler consumes this prompt, so Pi emits neither
+	// before_agent_start nor a turn for it.
+	h.addInputHandler(() => ({ action: "handled" }));
+	const handled = await h.dispatchInput({ type: "input", source: "interactive", text: "handled" });
+	assert.equal(handled.action, "handled");
+
+	// An unrelated native custom notification starts the next turn. Its source
+	// was never correlated with the consumed prompt and must remain unknown.
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	assert.equal(observations(h).at(-1).wakeSource, "unknown");
 });
 
 test("/goal status reports the expected source and quiet heartbeat state", options, async () => {
@@ -237,7 +278,7 @@ test("native wake ends the wait before provider work without adding a resume mar
 	await createGoal(h);
 	await yieldGoal(h, "event");
 	h.sent.length = 0;
-	h.handlers.get("input")({ type: "input", source: "interactive", text: "the event completed" }, h.ctx);
+	await acceptedInput(h, "interactive", "the event completed");
 	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
 	assert.equal(lastGoal(h).status, "active");
 	assert.equal(h.sent.length, 0);
