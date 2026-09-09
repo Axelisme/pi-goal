@@ -336,6 +336,29 @@ test("yield settlement keeps native compaction ordering without a synthetic wake
 	assert.equal(h.sent.length, 0);
 });
 
+test("a compaction cancelled by another context owner settles without a failure warning", options, async () => {
+	const h = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
+	await install(h);
+	await createGoal(h);
+	await yieldGoal(h, "event", "compact after handoff");
+	await waitForSettlement(h);
+	assert.equal(h.compactions.length, 1);
+	h.notices.length = 0;
+	h.compactions[0].onError(new Error("Compaction cancelled"));
+	assert.deepEqual(h.notices, [], "another owner's cancellation is not a pi-goal failure");
+	assert.equal(lastGoal(h).status, "yielded");
+
+	const failing = makeHarness({ runtimeSupport: true, contextTokens: 150_000 });
+	await install(failing);
+	await createGoal(failing);
+	await yieldGoal(failing, "event");
+	await waitForSettlement(failing);
+	failing.notices.length = 0;
+	failing.compactions[0].onError(new Error("summarizer unavailable"));
+	assert.equal(failing.notices.length, 1);
+	assert.match(failing.notices[0], /Goal yield compaction failed/);
+});
+
 test("settlement waits for idle and rechecks context usage", options, async () => {
 	const h = makeHarness({ runtimeSupport: true, contextTokens: 150_000, idle: false });
 	await install(h);

@@ -596,6 +596,15 @@ function settlePendingYield(pi: ExtensionAPI, ctx: ExtensionContext, pending: Pe
 	runPendingCompaction(pi, ctx, pending, () => maybeDeliverDueYieldTimeout(pi, ctx));
 }
 
+// Another extension can own context compression and cancel Pi's compaction from
+// session_before_compact. Pi surfaces that decision as this exact error, which
+// reports a different owner rather than a failure of this settlement.
+const COMPACTION_CANCELLED_MESSAGE = "Compaction cancelled";
+
+function compactionWasCancelledByOwner(error: unknown): boolean {
+	return (error instanceof Error ? error.message : String(error)) === COMPACTION_CANCELLED_MESSAGE;
+}
+
 function runPendingCompaction(_pi: ExtensionAPI, ctx: ExtensionContext, pending: PendingYield, onSettled?: () => void) {
 	if (!pending.compactRequested) {
 		onSettled?.();
@@ -628,14 +637,18 @@ function runPendingCompaction(_pi: ExtensionAPI, ctx: ExtensionContext, pending:
 			},
 			onError: (error: unknown) => {
 				if (!ownsCompaction(owner)) return;
-				ctx.ui.notify(`Goal yield compaction failed: ${String(error)}`, "warning");
+				if (!compactionWasCancelledByOwner(error)) {
+					ctx.ui.notify(`Goal yield compaction failed: ${String(error)}`, "warning");
+				}
 				finish();
 			},
 		});
 	} catch (error) {
 		if (!ownsCompaction(owner)) return;
 		activeCompaction = null;
-		ctx.ui.notify(`Goal yield compaction failed: ${String(error)}`, "warning");
+		if (!compactionWasCancelledByOwner(error)) {
+			ctx.ui.notify(`Goal yield compaction failed: ${String(error)}`, "warning");
+		}
 		onSettled?.();
 	}
 }
