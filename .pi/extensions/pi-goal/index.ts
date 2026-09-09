@@ -298,7 +298,7 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 		case "yielded":
 			return `The active thread goal has yielded control until a real external event starts another agent turn. Do not continue autonomously and do not poll or set a timer.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nYield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
 		case "timeout":
-			return `The yielded goal reached its configured deadline and has been paused. Do not continue autonomously. Return control to the user and report that the prerequisite is still pending.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nYield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
+			return `The yielded goal reached its configured deadline before an external wake was observed. Reassess the prerequisite; do not assume it completed. Continue safe work if possible, or call yield_goal again only for a concrete future event.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nPrior yield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
 		case "budget_limited":
 			return budgetLimitPrompt(state);
 		case "paused":
@@ -541,14 +541,12 @@ function deliverYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, operation:
 	// failure nor a later lifecycle callback may re-arm this one-shot wake.
 	armedYieldTimeout = null;
 	operation.handle = null;
-	const previous = goal;
-	if (!previous) return;
-	const paused: GoalState = { ...endWaitSequence(previous), status: "paused", updatedAt: Date.now() };
-	const outcome = persist(pi, ctx, paused, "revoke");
-	if (reportPersistenceFailure(ctx, "Goal timeout pause revoked autonomy in memory but is nondurable", outcome)) return;
-	recordWaitEndAfterPersist(pi, ctx, previous, outcome, "timeout");
+	const yielded = goal;
+	if (!yielded) return;
+	const outcome = persist(pi, ctx, yielded, "retain");
+	if (reportPersistenceFailure(ctx, "Goal timeout remained yielded in memory but is nondurable", outcome)) return;
 	try {
-		emitGoalEvent(pi, "timeout", paused, { triggerTurn: true, deliverAs: "followUp" });
+		emitGoalEvent(pi, "timeout", yielded, { triggerTurn: true, deliverAs: "followUp" });
 	} catch (error) {
 		ctx.ui.notify(`Goal timeout follow-up could not be published: ${String(error)}`, "warning");
 	}

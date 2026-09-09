@@ -236,11 +236,11 @@ test("an armed wait reports its fixed deadline and timeout set affects only the 
 	assert.match(changed, /Configured yield timeout: 1h/);
 	assert.match(changed, /Active deadline: 2026-09-08T00:29:00.000Z/);
 	t.mock.timers.tick(29 * minute);
-	assert.equal(lastGoal(h).status, "paused");
+	assert.equal(lastGoal(h).status, "yielded");
 	await assertNoActiveTimeout(h, timers, "delivered configured deadline");
 });
 
-test("deadline durably pauses once before publishing one timeout follow-up", options, async (t) => {
+test("deadline keeps the goal yielded until its one timeout follow-up starts", options, async (t) => {
 	const timers = enableTimers(t);
 	const h = makeHarness();
 	await install(h);
@@ -249,19 +249,27 @@ test("deadline durably pauses once before publishing one timeout follow-up", opt
 	h.sent.length = 0;
 	await yieldGoal(h, "deployment is unfinished");
 	const waitId = lastGoal(h).waitId;
+	const waitStartedAt = lastGoal(h).waitStartedAt;
 	t.mock.timers.tick(1_000);
 
-	assert.equal(lastGoal(h).status, "paused");
+	assert.equal(lastGoal(h).status, "yielded");
+	assert.equal(lastGoal(h).waitId, waitId);
+	assert.equal(lastGoal(h).waitStartedAt, waitStartedAt);
+	assert.equal(observations(h).filter((entry) => entry.kind === "wait_ended" && entry.waitId === waitId).length, 0);
+	assert.equal(h.sent.length, 1);
+	assert.equal(h.sent[0].entryCount, h.entries.length, "durable yielded state precedes publication");
+	assert.equal(h.sent[0].message.details.kind, "timeout");
+	assert.equal(h.sent[0].message.details.goal.status, "yielded");
+	assert.match(h.sent[0].message.content, /deployment is unfinished/);
+	assert.doesNotMatch(h.sent[0].message.content, /paused|stop pursuing|do not continue/i);
+	assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
+
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	assert.equal(lastGoal(h).status, "active");
 	assert.equal(lastGoal(h).waitId, undefined);
 	const ended = observations(h).filter((entry) => entry.kind === "wait_ended" && entry.waitId === waitId);
 	assert.equal(ended.length, 1);
-	assert.equal(ended[0].terminationReason, "timeout");
-	assert.equal(h.sent.length, 1);
-	assert.equal(h.sent[0].entryCount, h.entries.length, "durable pause and observation precede publication");
-	assert.equal(h.sent[0].message.details.kind, "timeout");
-	assert.match(h.sent[0].message.content, /deployment is unfinished/);
-	assert.match(h.sent[0].message.content, /paused/i);
-	assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
+	assert.equal(ended[0].terminationReason, "native_wake");
 
 	t.mock.timers.tick(60 * minute);
 	assert.equal(h.sent.length, 1);
@@ -279,7 +287,7 @@ test("a real turn cancels timeout while an input candidate alone does not", opti
 	await yieldGoal(candidate);
 	await candidate.dispatchInput({ type: "input", source: "interactive", text: "candidate only" });
 	t.mock.timers.tick(1_000);
-	assert.equal(lastGoal(candidate).status, "paused");
+	assert.equal(lastGoal(candidate).status, "yielded");
 	assert.equal(candidate.sent.at(-1).message.details.kind, "timeout");
 	await assertNoActiveTimeout(candidate, timers, "input candidate timeout");
 
@@ -314,7 +322,7 @@ test("a due watchdog waits for idle settlement and still delivers at most once",
 
 	h.setIdle(true);
 	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
-	assert.equal(lastGoal(h).status, "paused");
+	assert.equal(lastGoal(h).status, "yielded");
 	assert.equal(h.sent.length, 1);
 	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
 	t.mock.timers.tick(60 * minute);
@@ -342,7 +350,7 @@ test("a timeout due during compaction delivers once after completion or error", 
 
 		if (outcome === "complete") h.compactions[0].onComplete({});
 		else h.compactions[0].onError(new Error("compaction failed"));
-		assert.equal(lastGoal(h).status, "paused", `${outcome}: timeout pauses after compaction settles`);
+		assert.equal(lastGoal(h).status, "yielded", `${outcome}: timeout keeps the goal yielded after compaction settles`);
 		assert.equal(h.sent.filter(({ message }) => message.details?.kind === "timeout").length, 1, `${outcome}: one timeout delivery`);
 
 		h.compactions[0].onComplete({});
@@ -379,7 +387,7 @@ test("a stale compaction callback cannot release a newer wait", options, async (
 		assert.equal(h.sent.filter(({ message }) => message.details?.kind === "timeout").length, 0, `${staleCallback}: no delivery before new compaction settles`);
 
 		h.compactions[1].onComplete({});
-		assert.equal(lastGoal(h).status, "paused", `${staleCallback}: new owner releases timeout`);
+		assert.equal(lastGoal(h).status, "yielded", `${staleCallback}: new owner releases timeout without pausing`);
 		assert.equal(h.sent.filter(({ message }) => message.details?.kind === "timeout").length, 1, `${staleCallback}: exactly one delivery`);
 		await assertNoActiveTimeout(h, timers, `stale compaction ${staleCallback}`);
 	}
