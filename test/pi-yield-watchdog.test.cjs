@@ -250,11 +250,13 @@ test("deadline keeps the goal yielded until its one timeout follow-up starts", o
 	await yieldGoal(h, "deployment is unfinished");
 	const waitId = lastGoal(h).waitId;
 	const waitStartedAt = lastGoal(h).waitStartedAt;
+	const waitTimeouts = lastGoal(h).waitTimeouts;
 	t.mock.timers.tick(1_000);
 
 	assert.equal(lastGoal(h).status, "yielded");
 	assert.equal(lastGoal(h).waitId, waitId);
 	assert.equal(lastGoal(h).waitStartedAt, waitStartedAt);
+	assert.equal(lastGoal(h).waitTimeouts, waitTimeouts);
 	assert.equal(observations(h).filter((entry) => entry.kind === "wait_ended" && entry.waitId === waitId).length, 0);
 	assert.equal(h.sent.length, 1);
 	assert.equal(h.sent[0].entryCount, h.entries.length, "durable yielded state precedes publication");
