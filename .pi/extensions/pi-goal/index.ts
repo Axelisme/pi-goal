@@ -22,7 +22,6 @@ import {
 } from "./goal-state";
 import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
 import { createGoalFooter } from "./footer";
-import { registerProviderCacheObservation } from "./provider-cache-observation";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
@@ -723,8 +722,6 @@ function agentRunWasAborted(messages: unknown): boolean {
 }
 
 export default function piGoal(pi: ExtensionAPI) {
-	registerProviderCacheObservation(pi);
-
 	pi.registerMessageRenderer(EVENT_TYPE, (message, { expanded }, theme) => {
 		const details = message.details as { kind?: GoalEventKind; goal?: GoalState | null; timestamp?: number } | undefined;
 		const kind = details?.kind ?? "continuation";
