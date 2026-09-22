@@ -112,6 +112,24 @@ async function yieldGoal(h, reason = "deployment is unfinished") {
 	return h.tools.get("yield_goal").execute("yield", { reason }, null, null, h.ctx);
 }
 
+async function deliverSelfEvent(h, kind) {
+	// Pi hands a queued goal event back on a turn of its own; the delivered message
+	// is what tells the extension which wake it is.
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await h.handlers.get("message_end")({
+		type: "message_end",
+		message: { role: "custom", customType: "pi-goal-event", content: [{ type: "text", text: kind }], details: { kind } },
+	}, h.ctx);
+}
+
+async function nativeCustomWake(h) {
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await h.handlers.get("message_end")({
+		type: "message_end",
+		message: { role: "custom", customType: "external-event", content: [{ type: "text", text: "the awaited event completed" }] },
+	}, h.ctx);
+}
+
 function goalEntries(h) {
 	return h.entries.filter((entry) => entry.customType === "pi-goal");
 }
@@ -266,12 +284,12 @@ test("deadline keeps the goal yielded until its one timeout follow-up starts", o
 	assert.doesNotMatch(h.sent[0].message.content, /paused|stop pursuing|do not continue/i);
 	assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
 
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await deliverSelfEvent(h, "timeout");
 	assert.equal(lastGoal(h).status, "active");
 	assert.equal(lastGoal(h).waitId, undefined);
 	const ended = observations(h).filter((entry) => entry.kind === "wait_ended" && entry.waitId === waitId);
 	assert.equal(ended.length, 1);
-	assert.equal(ended[0].terminationReason, "native_wake");
+	assert.equal(ended[0].terminationReason, "timeout", "the watchdog owns its own wake instead of posing as an external one");
 
 	t.mock.timers.tick(60 * minute);
 	assert.equal(h.sent.length, 1);
@@ -299,7 +317,7 @@ test("a real turn cancels timeout while an input candidate alone does not", opti
 	await createGoal(native);
 	await yieldGoal(native);
 	native.sent.length = 0;
-	await native.handlers.get("turn_start")({ type: "turn_start" }, native.ctx);
+	await nativeCustomWake(native);
 	t.mock.timers.tick(1_000);
 	assert.equal(lastGoal(native).status, "active");
 	assert.equal(native.sent.length, 0);

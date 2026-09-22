@@ -562,6 +562,32 @@ function maybeDeliverDueYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext) {
 	deliverYieldTimeout(pi, ctx, operation);
 }
 
+/**
+ * End the current wait and take back autonomous authority. Callers decide that a real
+ * external event arrived; this owns the timeout, persistence, and observation effects.
+ */
+function resumeYieldedGoal(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	wakeSource: WakeSource,
+	terminationReason: WaitTerminationReason = "native_wake",
+): boolean {
+	if (goal?.status !== "yielded") return false;
+	cancelYieldTimeout();
+	const previous = goal;
+	const resumed = resumeGoalState(endWaitSequence(goal));
+	if (!resumed) return false;
+	const outcome = persist(pi, ctx, resumed, "acquire");
+	if (!outcome.persisted) {
+		reportPersistenceFailure(ctx, "Goal resume remained yielded and nondurable", outcome);
+		return false;
+	}
+	recordWaitEnded(pi, ctx, previous, terminationReason, wakeSource);
+	// A wake identified mid-turn still owns the rest of that turn's usage.
+	if (activeTurnStartedAt !== null) activeGoalThisTurnId = resumed.id;
+	return true;
+}
+
 function reportPersistenceFailure(ctx: ExtensionContext, operation: string, outcome: PersistenceOutcome): boolean {
 	if (outcome.persisted) return false;
 	ctx.ui.notify(`${operation}: ${outcome.diagnostic ?? "durability unavailable"}`, "warning");
@@ -712,13 +738,13 @@ function queueContinuation(pi: ExtensionAPI, state: GoalState) {
 	});
 }
 
-function agentRunWasAborted(messages: unknown): boolean {
-	if (!Array.isArray(messages)) return false;
+function agentRunStopReason(messages: unknown): string | undefined {
+	if (!Array.isArray(messages)) return undefined;
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i] as { role?: string; stopReason?: string } | undefined;
-		if (message?.role === "assistant") return message.stopReason === "aborted";
+		if (message?.role === "assistant") return message.stopReason;
 	}
-	return false;
+	return undefined;
 }
 
 export default function piGoal(pi: ExtensionAPI) {
@@ -928,7 +954,22 @@ export default function piGoal(pi: ExtensionAPI) {
 	// Pi finalizes assistant messages before dispatching their tool calls. This
 	// replacement seam is before execution (unlike context, which is only before
 	// a later provider request), so siblings cannot run beside yield_goal.
-	pi.on("message_end", (event) => {
+	pi.on("message_end", (event, ctx) => {
+		// Delivery, not turn structure, is what identifies a wake: Pi opens a turn for a
+		// queued message long after it was written, so the message itself is the evidence.
+		if (goal?.status === "yielded") {
+			const delivered = event.message as { role?: string; customType?: string; details?: { kind?: GoalEventKind } } | undefined;
+			const ownEvent = delivered?.role === "custom" && delivered.customType === EVENT_TYPE;
+			if (ownEvent && delivered?.details?.kind === "timeout") {
+				// The watchdog owns this wake and says so, instead of posing as the
+				// external event it failed to observe.
+				resumeYieldedGoal(pi, ctx, "unknown", "timeout");
+			} else if (!ownEvent && (delivered?.role === "custom" || delivered?.role === "user")) {
+				resumeYieldedGoal(pi, ctx, "unknown");
+			}
+			// Any other goal-authored message is this goal talking to itself and never
+			// ends its own wait.
+		}
 		const message = enforceYieldExclusivity(event.message as any);
 		return message === event.message ? undefined : { message: message as any };
 	});
@@ -1180,20 +1221,14 @@ export default function piGoal(pi: ExtensionAPI) {
 		if (goal?.status === "yielded") {
 			// Only one candidate confirmed by before_agent_start can carry its source
 			// into this turn. Any overlap or unresolved candidate stays unknown.
-			// A real turn wins over a due-but-not-delivered watchdog operation.
-			cancelYieldTimeout();
-			const previous = goal;
+			const acceptedInput = pendingWakeSource !== null || pendingInputWakeAmbiguous;
 			const wakeSource = pendingInputWakeAmbiguous ? "unknown" : pendingWakeSource ?? "unknown";
 			clearPendingWakeSource();
-			const resumed = resumeGoalState(endWaitSequence(goal));
-			if (resumed) {
-				const outcome = persist(pi, ctx, resumed, "acquire");
-				if (!outcome.persisted) {
-					reportPersistenceFailure(ctx, "Goal resume remained yielded and nondurable", outcome);
-				} else {
-					recordWaitEnded(pi, ctx, previous, "native_wake", wakeSource);
-				}
-			}
+			// A turn alone is not an external event. Pi opens one whenever it resumes the
+			// loop, including to hand back a continuation this goal queued long before the
+			// yield, so only an accepted prompt wakes the wait here; every other turn waits
+			// for the delivered message to identify itself.
+			if (acceptedInput) resumeYieldedGoal(pi, ctx, wakeSource);
 		} else {
 			clearPendingWakeSource();
 		}
@@ -1222,7 +1257,21 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("agent_end", (event, ctx) => {
 		if (!goal) return;
-		if (agentRunWasAborted(event.messages)) {
+		const stopReason = agentRunStopReason(event.messages);
+		if (stopReason === "error") {
+			// Pi owns provider-error recovery: it retries the run itself, and that retry
+			// resumes from the tool results without draining its queues. A continuation
+			// queued here is never consumed by the retry; it lingers and is delivered on
+			// some later turn, including the one right after a terminal yield.
+			if (goal.status === "active") {
+				ctx.ui.notify(
+					`⚑ Goal continuation held after a provider error: ${truncateObjective(goal.objective)}\nPi retries the run itself; use /goal resume if it stops instead.`,
+					"warning",
+				);
+			}
+			return;
+		}
+		if (stopReason === "aborted") {
 			if (goal.status === "yielded") {
 				// An interrupted terminal handoff must not leave its process-local
 				// watchdog alive. The durable yielded state remains available for a

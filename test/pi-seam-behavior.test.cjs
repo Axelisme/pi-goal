@@ -85,11 +85,12 @@ test("Pi message_end filters sibling tools before execution and yield terminates
 	assert.equal(replaced.message.content.find((part) => part.type === "toolCall").name, "yield_goal");
 
 	const { Agent } = await import(`${globalPi}/node_modules/@earendil-works/pi-agent-core/dist/index.js`);
-	const { createAssistantMessageEventStream } = await import(`${globalPi}/node_modules/@earendil-works/pi-ai/dist/index.js`);
+	const { createAssistantMessageEventStream, getCurrentTools } = await import(`${globalPi}/node_modules/@earendil-works/pi-ai/dist/index.js`);
 	const model = { id: "snapshot-test", name: "snapshot-test", api: "test", provider: "test", reasoning: false };
 	const providerTools = [];
 	const streamFn = (_model, context) => {
-		providerTools.push((context.tools ?? []).map((tool) => tool.name));
+		// Pi 0.86 carries the tool loadout in the transcript rather than on the context.
+		providerTools.push(getCurrentTools(context.messages).map((tool) => tool.name));
 		const stream = createAssistantMessageEventStream();
 		const message = { role: "assistant", content: [{ type: "text", text: "waiting" }], api: "test", provider: "test", model: "snapshot-test", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() };
 		queueMicrotask(() => { stream.push({ type: "start", partial: message }); stream.push({ type: "done", reason: "stop", message }); });
@@ -152,6 +153,7 @@ test("reload pauses active goals and failed resume persistence remains yielded",
 	await h.tools.get("yield_goal").execute("yield", { reason: "external event" }, null, null, h.ctx);
 	h.setAppendThrows(true);
 	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	h.handlers.get("message_end")({ type: "message_end", message: { role: "custom", customType: "external-event", content: [{ type: "text", text: "the awaited event completed" }] } }, h.ctx);
 	assert.equal(lastGoal(h).status, "yielded", "failed resume keeps the durable witness yielded");
 	assert.equal(h.notices.some((notice) => String(notice).includes("resume remained yielded")), true);
 	h.handlers.get("session_shutdown")({ reason: "quit" }, h.ctx);

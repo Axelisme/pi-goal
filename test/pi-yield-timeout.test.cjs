@@ -142,6 +142,16 @@ async function acceptedInput(h, source, text = "wake") {
 	}, h.ctx);
 }
 
+async function nativeCustomWake(h) {
+	// Pi opens the turn first and then hands over the message that started it; the
+	// delivered message is what identifies the wake.
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await h.handlers.get("message_end")({
+		type: "message_end",
+		message: { role: "custom", customType: "external-event", content: [{ type: "text", text: "the awaited event completed" }] },
+	}, h.ctx);
+}
+
 async function waitForSettlement(h) {
 	await h.handlers.get("agent_settled")({ type: "agent_settled" }, h.ctx);
 	await Promise.resolve();
@@ -206,8 +216,7 @@ test("wait observations are paired, bounded, and excluded from the provider conv
 		assert.equal(entry.goalId, lastGoal(h).id);
 	}
 
-	h.handlers.get("input")({ type: "input", source: "extension", text: "notification" }, h.ctx);
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await nativeCustomWake(h);
 	const ended = observations(h).at(-1);
 	assert.equal(ended.kind, "wait_ended");
 	assert.equal(ended.waitId, started[0].waitId);
@@ -249,7 +258,7 @@ test("a handled interactive input cannot label an unrelated native wake", option
 
 	// An unrelated native custom notification starts the next turn. Its source
 	// was never correlated with the consumed prompt and must remain unknown.
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await nativeCustomWake(h);
 	assert.equal(observations(h).at(-1).wakeSource, "unknown");
 });
 

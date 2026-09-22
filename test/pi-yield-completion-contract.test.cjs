@@ -64,6 +64,16 @@ async function createYielded(h, objective = "wait for the provider", reason = "p
 	h.sent.length = 0;
 }
 
+async function nativeCustomWake(h) {
+	// Pi opens the turn and then delivers the message that started it; the delivered
+	// message, not the turn, is what ends the wait.
+	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await h.handlers.get("message_end")({
+		type: "message_end",
+		message: { role: "custom", customType: "external-event", content: [{ type: "text", text: "the awaited event completed" }] },
+	}, h.ctx);
+}
+
 function lastGoal(h) {
 	for (let i = h.entries.length - 1; i >= 0; i--) {
 		if (h.entries[i].customType === "pi-goal") return h.entries[i].data?.goal;
@@ -114,7 +124,7 @@ test("goal tools stay stable while lifecycle validity is enforced at execution",
 	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "creating a goal must not change Tool schemas");
 	await h.tools.get("yield_goal").execute("yield", { reason: "wait" }, null, null, h.ctx);
 	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "yielding must not change Tool schemas");
-	await h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await nativeCustomWake(h);
 	assert.deepEqual(h.pi.getActiveTools(), stableGoalTools, "resuming must not change Tool schemas");
 
 	const completed = await h.tools.get("update_goal").execute("update", { status: "complete" }, null, null, h.ctx);
@@ -302,6 +312,7 @@ test("a later yielded run keeps its native custom wake entry across provider req
 	});
 	agent.subscribe((event) => {
 		if (event.type === "turn_start") h.handlers.get("turn_start")(event, h.ctx);
+		if (event.type === "message_end") h.handlers.get("message_end")(event, h.ctx);
 	});
 	const persistentWake = {
 		role: "custom",
@@ -323,8 +334,11 @@ test("a later yielded run keeps its native custom wake entry across provider req
 		assert.deepEqual(wakes[0], persistentWake);
 		assert.equal(messages.some((message) => message.customType === "pi-goal-event" && message.details?.resume === true), false);
 	}
-	assert.deepEqual(providerContexts[0][0], persistentWake);
-	assert.deepEqual(providerContexts[1][0], persistentWake, "the later request keeps the native wake in its prior prefix");
+	// Pi 0.86 leads the transcript with a replayed system message carrying the prompt
+	// and tool loadout, so the wake is the first conversation message after it.
+	const firstConversationMessages = providerContexts.map((messages) => messages.find((message) => message.role !== "system"));
+	assert.deepEqual(firstConversationMessages[0], persistentWake);
+	assert.deepEqual(firstConversationMessages[1], persistentWake, "the later request keeps the native wake in its prior prefix");
 
 	h.handlers.get("agent_end")({}, h.ctx);
 	h.handlers.get("agent_end")({}, h.ctx);
@@ -340,7 +354,7 @@ test("a yielded resume with a pending same-run message adds no duplicate continu
 	await install(h);
 	await createYielded(h, "resume the same run", "waiting for a pending event");
 
-	h.handlers.get("turn_start")({ type: "turn_start" }, h.ctx);
+	await nativeCustomWake(h);
 	assert.equal(lastGoal(h).status, "active");
 	h.handlers.get("agent_end")({}, h.ctx);
 	await flushMicrotasks();
