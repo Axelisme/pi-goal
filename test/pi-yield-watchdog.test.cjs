@@ -470,3 +470,68 @@ test("failed yield persistence and failed timeout persistence publish no timeout
 	assert.equal(failedTimeout.sent.length, 0);
 	await assertNoActiveTimeout(failedTimeout, timers, "failed timeout persistence");
 });
+
+async function finishTool(h, toolName, isError = false) {
+	await h.handlers.get("tool_result")({ type: "tool_result", toolName, toolCallId: `call-${toolName}`, input: {}, content: [], details: undefined, isError }, h.ctx);
+}
+
+test("re-yield after a timeout without edit or write waits without another deadline", options, async (t) => {
+	const timers = enableTimers(t);
+	const h = makeHarness();
+	await install(h);
+	await h.commands.get("goal").handler("timeout set 1s", h.ctx);
+	await createGoal(h);
+	await yieldGoal(h);
+	t.mock.timers.tick(1_000);
+	await deliverSelfEvent(h, "timeout");
+	await finishTool(h, "read");
+	await finishTool(h, "edit", true);
+	await finishTool(h, "write", true);
+	const quietYield = await yieldGoal(h);
+	assert.equal(quietYield.details.timeoutArmed, false);
+	assert.equal(lastGoal(h).status, "yielded");
+	await assertNoActiveTimeout(h, timers, "no qualifying work since timeout");
+	assert.match(await timeoutStatus(h), /Automatic recheck: exhausted.*waiting for an external wake/);
+	t.mock.timers.tick(60 * minute);
+	assert.equal(h.sent.filter(({ message }) => message.details?.kind === "timeout").length, 1);
+	await nativeCustomWake(h);
+	assert.equal(lastGoal(h).status, "active");
+	await yieldGoal(h);
+	assert.equal(timers.count(), 1, "a real external wake starts a new timeout opportunity");
+});
+
+test("work before the timeout does not qualify for the next recheck", options, async (t) => {
+	const timers = enableTimers(t);
+	const h = makeHarness();
+	await install(h);
+	await h.commands.get("goal").handler("timeout set 1s", h.ctx);
+	await createGoal(h);
+	await finishTool(h, "edit");
+	await yieldGoal(h);
+	t.mock.timers.tick(1_000);
+	await deliverSelfEvent(h, "timeout");
+	await yieldGoal(h);
+	await assertNoActiveTimeout(h, timers, "work must follow the last timeout");
+});
+
+for (const toolName of ["edit", "write"]) {
+	test(`successful ${toolName} after timeout permits one more deadline`, options, async (t) => {
+		const timers = enableTimers(t);
+		const h = makeHarness();
+		await install(h);
+		await h.commands.get("goal").handler("timeout set 1s", h.ctx);
+		await createGoal(h);
+		await yieldGoal(h);
+		t.mock.timers.tick(1_000);
+		await deliverSelfEvent(h, "timeout");
+		await finishTool(h, toolName);
+		const continued = await yieldGoal(h);
+		assert.equal(continued.details.timeoutArmed, true);
+		assert.equal(timers.count(), 1, `${toolName} permits a new timeout`);
+		t.mock.timers.tick(1_000);
+		assert.equal(h.sent.filter(({ message }) => message.details?.kind === "timeout").length, 2);
+		await deliverSelfEvent(h, "timeout");
+		await yieldGoal(h);
+		await assertNoActiveTimeout(h, timers, "progress must follow the most recent timeout");
+	});
+}

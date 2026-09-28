@@ -81,6 +81,10 @@ let goal: GoalState | null = null;
 let statusBarEnabled = true;
 let yieldTimeoutSetting: YieldTimeoutSetting = { milliseconds: DEFAULT_YIELD_TIMEOUT_MS, label: "29m" };
 let armedYieldTimeout: ArmedYieldTimeout | null = null;
+// One timeout recheck per stretch without a successful edit or write.
+// Like the watchdog, this authority is process-local and is revoked on restore.
+let timeoutRecheckGoalId: string | null = null;
+let qualifyingWorkSinceTimeout = false;
 let goalFooterInstalled = false;
 let activeTurnStartedAt: number | null = null;
 let activeGoalThisTurnId: string | null = null;
@@ -112,6 +116,8 @@ function clearPendingWakeSource() {
 function clearPendingWaitWork() {
 	pendingYield = null;
 	cancelYieldTimeout();
+	timeoutRecheckGoalId = null;
+	qualifyingWorkSinceTimeout = false;
 	clearPendingWakeSource();
 	clearCompactionTracking();
 }
@@ -254,7 +260,10 @@ function armYieldTimeout(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalSta
 
 function timeoutStatusText(ctx: ExtensionContext): string {
 	const operation = armedYieldTimeout;
-	if (!operation) return `Configured yield timeout: ${yieldTimeoutSetting.label}\nActive deadline: none`;
+	if (!operation) {
+		const quietWait = goal?.status === "yielded" && goal.id === timeoutRecheckGoalId && !qualifyingWorkSinceTimeout;
+		return `Configured yield timeout: ${yieldTimeoutSetting.label}\nActive deadline: none${quietWait ? "\nAutomatic recheck: exhausted without a successful edit or write; waiting for an external wake" : ""}`;
+	}
 	if (!operationMatchesCurrent(ctx, operation)) {
 		cancelYieldTimeout();
 		return `Configured yield timeout: ${yieldTimeoutSetting.label}\nActive deadline: none`;
@@ -297,7 +306,7 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 		case "yielded":
 			return `The active thread goal has yielded control until a real external event starts another agent turn. Do not continue autonomously and do not poll or set a timer.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nYield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
 		case "timeout":
-			return `The yielded goal reached its configured deadline before an external wake was observed. Reassess the prerequisite; do not assume it completed. Continue safe work if possible, or call yield_goal again only for a concrete future event.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nPrior yield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
+			return `The yielded goal reached its configured deadline before an external wake was observed. Reassess the prerequisite; do not assume it completed. Continue safe work if possible, or call yield_goal again only for a concrete future event. Without a successful edit or write after this timeout, another yield will wait without a new automatic deadline.\n\nObjective: ${escapeUntrusted(state.objective)}\n\nPrior yield reason (diagnostic data): ${escapeUntrusted(state.yieldReason ?? "external prerequisite")}`;
 		case "budget_limited":
 			return budgetLimitPrompt(state);
 		case "paused":
@@ -510,6 +519,10 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 		};
 	}
 	goal = next;
+	if (!next || (previous && next.id !== previous.id) || (next.status !== "active" && next.status !== "yielded")) {
+		timeoutRecheckGoalId = null;
+		qualifyingWorkSinceTimeout = false;
+	}
 	if (next?.status !== "active") {
 		continuationQueued = false;
 	}
@@ -583,6 +596,8 @@ function resumeYieldedGoal(
 		return false;
 	}
 	recordWaitEnded(pi, ctx, previous, terminationReason, wakeSource);
+	timeoutRecheckGoalId = terminationReason === "timeout" ? resumed.id : null;
+	qualifyingWorkSinceTimeout = false;
 	// A wake identified mid-turn still owns the rest of that turn's usage.
 	if (activeTurnStartedAt !== null) activeGoalThisTurnId = resumed.id;
 	return true;
@@ -885,9 +900,13 @@ export default function piGoal(pi: ExtensionAPI) {
 			const previous = goal;
 			clearCompactionTracking();
 			const outcome = persist(pi, ctx, next, "revoke");
+			let timeoutArmed = false;
 			if (outcome.persisted) {
 				if (!previous || previous.waitId !== next.waitId) recordWaitStarted(pi, ctx, next);
-				armYieldTimeout(pi, ctx, next);
+				if (timeoutRecheckGoalId !== next.id || qualifyingWorkSinceTimeout) {
+					armYieldTimeout(pi, ctx, next);
+					timeoutArmed = armedYieldTimeout !== null && operationMatchesCurrent(ctx, armedYieldTimeout);
+				}
 				pendingYield = {
 					goalId: next.id,
 					yieldedAt: next.yieldedAt,
@@ -898,8 +917,8 @@ export default function piGoal(pi: ExtensionAPI) {
 			// this terminal action into a wake-up. The result and status are the handoff.
 			const waiting = outcome.persisted ? waitingDetails(next) : null;
 			return {
-				content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, terminal: true, terminalAction: "yield", waiting, persisted: outcome.persisted, diagnostic: outcome.diagnostic ?? null }, null, 2) }],
-				details: { goal: outcome.goal, terminal: true, terminalAction: "yield", waiting, persisted: outcome.persisted, diagnostic: outcome.diagnostic },
+				content: [{ type: "text", text: JSON.stringify({ goal: outcome.goal, terminal: true, terminalAction: "yield", waiting, timeoutArmed, persisted: outcome.persisted, diagnostic: outcome.diagnostic ?? null }, null, 2) }],
+				details: { goal: outcome.goal, terminal: true, terminalAction: "yield", waiting, timeoutArmed, persisted: outcome.persisted, diagnostic: outcome.diagnostic },
 				terminate: true,
 			} as any;
 		},
@@ -949,6 +968,13 @@ export default function piGoal(pi: ExtensionAPI) {
 				details: { goal: next },
 			};
 		},
+	});
+
+	pi.on("tool_result", (event) => {
+		if (goal?.status === "active" && goal.id === timeoutRecheckGoalId && !event.isError
+			&& (event.toolName === "edit" || event.toolName === "write")) {
+			qualifyingWorkSinceTimeout = true;
+		}
 	});
 
 	// Pi finalizes assistant messages before dispatching their tool calls. This
